@@ -1,0 +1,5 @@
+{
+  "bundle": {
+    "resources": { "resources/node": "node", "resources/orcad": "orcad", "resources/web": "web" }
+  }
+}

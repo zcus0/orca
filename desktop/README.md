@@ -1,13 +1,28 @@
-# Orca RS — desktop shell (Tauri)
+# Orca RS — desktop (Tauri)
 
-A lightweight desktop shell for Orca, built with [Tauri](https://tauri.app)
-(Rust + the operating system's webview) instead of Electron.
+A lightweight desktop build of Orca: a [Tauri](https://tauri.app) shell
+(Rust + the operating system's webview) instead of Electron, with the real
+Orca runtime running **locally on this machine**.
 
-The window loads the Orca web client from **https://orca.zcus.dev**. All
-sessions, terminals and agents run on the remote Orca server — this app is
-only the shell, so it uses a fraction of the RAM of the Electron build.
-Pairing works exactly like in a browser: open the app, sign in, and paste
-the pairing link offered by your Orca server.
+## How it works
+
+The installer bundles three resources next to the app binary:
+
+- `orcad/` — the Orca runtime bundle (`pnpm build:orcad`)
+- `web/` — the Orca web client (`pnpm build:web`)
+- `node` / `node.exe` — a Node 24 runtime
+
+On launch, the Rust shell spawns `node orcad.js --port 0 --bind 127.0.0.1
+--json --web-client-root web/` with `ORCA_USER_DATA` pointed at a per-user
+data directory, reads the `orca_server_ready` line, and navigates the window
+to the reported `webClientUrl` (which carries the pairing offer, so the
+client pairs with the local runtime automatically). Projects, terminals and
+agents run locally; remote Orca servers can still be paired from inside the
+client. Closing the app stops the runtime it started.
+
+The client UI is the web-client feature set. Features that exist only
+through the Electron preload bridge (integrated browser tabs, emulator,
+native dialogs) are not part of this build.
 
 ## Downloads
 
@@ -24,6 +39,18 @@ Builds are unsigned. On Windows, SmartScreen will warn — choose
 ## Local build
 
 ```sh
+# from the repository root: build the runtime and client for your platform
+pnpm install --frozen-lockfile
+pnpm -C mobile install --frozen-lockfile
+pnpm build:web
+pnpm build:orcad
+
+# assemble the bundled resources (CI does the same, plus downloads Node)
+mkdir -p desktop/resources
+cp -r out/web desktop/resources/web
+cp -r out/orcad desktop/resources/orcad
+cp "$(which node)" desktop/resources/node        # node.exe on Windows
+
 cd desktop
 npm install
 npx tauri icon ../resources/build/icon.png   # generates src-tauri/icons/
@@ -33,7 +60,14 @@ npx tauri build                              # or: npx tauri dev
 Linux build dependencies (Debian/Ubuntu): `libwebkit2gtk-4.1-dev`,
 `libappindicator3-dev`, `librsvg2-dev`, `patchelf`.
 
-## Changing the server
+Headless smoke test of the runtime supervisor (no display needed):
 
-Edit `app.windows[0].url` in `src-tauri/tauri.conf.json`
-(e.g. `https://orca.zcus6.zcus.dev` or `https://orca-rs.zcus.dev`).
+```sh
+ORCA_RS_TEST_SPAWN=1 \
+ORCA_RS_NODE=desktop/resources/node \
+ORCA_RS_ORCAD_ENTRY=desktop/resources/orcad/orcad.js \
+ORCA_RS_WEB_DIR=desktop/resources/web \
+ORCA_RS_DATA_DIR=/tmp/orca-rs-test \
+  desktop/src-tauri/target/release/orca-rs-desktop
+# prints: WEB_CLIENT_URL http://127.0.0.1:<port>/web-index.html#pairing=...
+```

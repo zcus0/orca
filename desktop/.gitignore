@@ -1,2 +1,7 @@
 node_modules
 src-tauri/target
+# Assembled by CI (pnpm build:web / build:orcad / Node download); never commit.
+resources/web
+resources/orcad
+resources/node
+resources/node.exe

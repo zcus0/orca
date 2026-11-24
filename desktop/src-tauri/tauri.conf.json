@@ -10,7 +10,6 @@
         "minHeight": 600,
         "minWidth": 900,
         "title": "Orca RS",
-        "url": "https://orca.zcus.dev",
         "width": 1440
       }
     ]
@@ -26,12 +25,12 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "longDescription": "A lightweight Tauri (Rust + system webview) shell that loads the Orca web client. Sessions run on the remote Orca server; this app replaces the Electron desktop shell for remote work.",
-    "shortDescription": "Orca RS - Tauri shell for the Orca web client",
+    "longDescription": "Orca RS is a lightweight desktop build of Orca. It bundles the Orca runtime (orcad) and a Node runtime, starts the runtime locally on loopback, and shows the Orca client in a system-webview window. Projects, terminals and agents run on this machine; remote Orca servers can still be paired.",
+    "shortDescription": "Orca RS - local Orca desktop, Tauri shell",
     "targets": "all",
     "windows": { "webviewInstallMode": { "type": "downloadBootstrapper" } }
   },
   "identifier": "dev.zcus.orca.rs",
   "productName": "Orca RS",
-  "version": "0.1.0"
+  "version": "0.2.0"
 }
