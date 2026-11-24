@@ -131,6 +131,7 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm -C mobile install --frozen-lockfile
           pnpm build:web
+          pnpm build:mobile-web
           pnpm build:orcad
       - name: Assemble the bundled runtime resources
         shell: bash
