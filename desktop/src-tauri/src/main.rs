@@ -60,6 +60,7 @@ fn spawn_orcad(
         .arg("--web-client-root")
         .arg(web_dir)
         .env("ORCA_USER_DATA", data_dir)
+        .env("ORCA_USER_DATA_PATH", data_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::from(log))
         .spawn()
@@ -126,6 +127,27 @@ fn show_startup_error(app: &tauri::AppHandle, message: &str) {
     }
 }
 
+/// The original Orca profile directory, mirroring upstream's
+/// getPlatformUserDataPath (the packaged app's own profile): %APPDATA%\orca
+/// on Windows, ~/Library/Application Support/orca on macOS, ~/.config/orca
+/// on Linux. The local runtime must use this profile — not a fresh one — so
+/// it keeps the user's installation identity, account, environments and
+/// settings, exactly like the desktop app's own serve mode does (upstream
+/// points serve at the desktop profile; orcad's instance lock makes two
+/// runtimes sharing it refuse each other). ORCA_RS_DATA_DIR overrides it.
+fn profile_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    if let Ok(custom) = std::env::var("ORCA_RS_DATA_DIR") {
+        if !custom.trim().is_empty() {
+            return Ok(PathBuf::from(custom));
+        }
+    }
+    let base = app
+        .path()
+        .config_dir()
+        .map_err(|e| format!("config dir unavailable: {e}"))?;
+    Ok(base.join("orca"))
+}
+
 fn start_local_runtime(app: &tauri::AppHandle) {
     let handle = app.clone();
     std::thread::spawn(move || {
@@ -136,10 +158,10 @@ fn start_local_runtime(app: &tauri::AppHandle) {
                 return;
             }
         };
-        let data_dir = match handle.path().app_data_dir() {
-            Ok(dir) => dir.join("runtime"),
+        let data_dir = match profile_dir(&handle) {
+            Ok(dir) => dir,
             Err(e) => {
-                show_startup_error(&handle, &format!("app data dir unavailable: {e}"));
+                show_startup_error(&handle, &e);
                 return;
             }
         };

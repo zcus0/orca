@@ -1,6 +1,6 @@
 [package]
 name = "orca-rs-desktop"
-version = "0.2.1"
+version = "0.2.2"
 description = "Orca RS - lightweight Tauri shell for the Orca web client"
 edition = "2021"
 

@@ -17,7 +17,11 @@ The installer bundles three resources next to the app binary:
 On launch, the Rust shell resolves the pinned runtime from the slot's
 `.server-target` / `.runtime-node` markers, spawns it on `orcad.js --port 0
 --bind 127.0.0.1 --json --web-client-root web/` with `ORCA_USER_DATA`
-pointed at a per-user data directory, reads the `orca_server_ready` line,
+pointed at the original Orca profile directory (`%APPDATA%\orca` on
+Windows, `~/Library/Application Support/orca` on macOS, `~/.config/orca`
+on Linux — the same profile the packaged Orca app itself uses, so the
+runtime keeps the user's identity, account and settings; don't run both
+apps at once, orcad's instance lock will refuse the second one), reads the `orca_server_ready` line,
 and navigates the window to the reported `webClientUrl` (which carries the
 pairing offer, so the client pairs with the local runtime automatically).
 Projects, terminals and agents run locally; remote Orca servers can still
