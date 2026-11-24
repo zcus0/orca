@@ -10,15 +10,20 @@ The installer bundles three resources next to the app binary:
 
 - `orcad/` — the Orca runtime bundle (`pnpm build:orcad`)
 - `web/` — the Orca web client (`pnpm build:web`)
-- `node` / `node.exe` — a Node 24 runtime
+- `runtimes/node-<sha256>/` — the exact Node runtime the orcad bundle is
+  pinned to (staged by `build:orcad` next to the slot; orcad refuses to
+  start without it)
 
-On launch, the Rust shell spawns `node orcad.js --port 0 --bind 127.0.0.1
---json --web-client-root web/` with `ORCA_USER_DATA` pointed at a per-user
-data directory, reads the `orca_server_ready` line, and navigates the window
-to the reported `webClientUrl` (which carries the pairing offer, so the
-client pairs with the local runtime automatically). Projects, terminals and
-agents run locally; remote Orca servers can still be paired from inside the
-client. Closing the app stops the runtime it started.
+On launch, the Rust shell resolves the pinned runtime from the slot's
+`.server-target` / `.runtime-node` markers, spawns it on `orcad.js --port 0
+--bind 127.0.0.1 --json --web-client-root web/` with `ORCA_USER_DATA`
+pointed at a per-user data directory, reads the `orca_server_ready` line,
+and navigates the window to the reported `webClientUrl` (which carries the
+pairing offer, so the client pairs with the local runtime automatically).
+Projects, terminals and agents run locally; remote Orca servers can still
+be paired from inside the client. Closing the app stops the runtime it
+started. If startup fails, the loading page shows the error and orcad's
+stderr is kept in `runtime.log` inside the app data dir.
 
 The client UI is the web-client feature set. Features that exist only
 through the Electron preload bridge (integrated browser tabs, emulator,

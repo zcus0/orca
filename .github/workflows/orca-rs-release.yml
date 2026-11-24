@@ -139,27 +139,10 @@ jobs:
           mkdir -p desktop/resources
           cp -r out/web desktop/resources/web
           cp -r out/orcad desktop/resources/orcad
-          NODE_VER=$(curl -s https://nodejs.org/dist/index.json | python3 -c "import json,sys; print(next(x['version'] for x in json.load(sys.stdin) if x['version'].startswith('v24.')))")
-          echo "Bundling Node $NODE_VER ($RUNNER_OS)"
-          case "$RUNNER_OS" in
-            Windows)
-              curl -sL "https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-win-x64.zip" -o /tmp/node.zip
-              unzip -q /tmp/node.zip -d /tmp/nodex
-              cp "/tmp/nodex/node-$NODE_VER-win-x64/node.exe" desktop/resources/node.exe
-              ;;
-            Linux)
-              curl -sL "https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-linux-x64.tar.xz" -o /tmp/node.tar.xz
-              tar -xJf /tmp/node.tar.xz -C /tmp
-              cp "/tmp/node-$NODE_VER-linux-x64/bin/node" desktop/resources/node
-              chmod +x desktop/resources/node
-              ;;
-            macOS)
-              curl -sL "https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-darwin-arm64.tar.gz" -o /tmp/node.tar.gz
-              tar -xzf /tmp/node.tar.gz -C /tmp
-              cp "/tmp/node-$NODE_VER-darwin-arm64/bin/node" desktop/resources/node
-              chmod +x desktop/resources/node
-              ;;
-          esac
+          # orcad refuses to start without its pinned Node runtime, staged by
+          # build:orcad as a sibling of the slot at out/runtimes/node-<sha>/.
+          cp -r out/runtimes desktop/resources/runtimes
+          ls desktop/resources/runtimes
           du -sh desktop/resources/*
       - name: Install the Tauri CLI
         working-directory: desktop

@@ -1,8 +1,8 @@
 {
   "bundle": {
     "resources": {
-      "../resources/node.exe": "node.exe",
       "../resources/orcad": "orcad",
+      "../resources/runtimes": "runtimes",
       "../resources/web": "web"
     }
   }
