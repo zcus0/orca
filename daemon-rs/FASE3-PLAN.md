@@ -321,3 +321,18 @@ separate server. Consequences:
   opt-in binary until a milestone's acceptance test passes against the
   real web client.
 - No changes to the profile format. Read-only until M3.
+
+## Release lines (2026-11-24, his call)
+
+Two separate lines, separate branches and tag prefixes — never a bare `v*` tag again:
+
+- **Tauri line** — branch `tauri`, tags `tauri-v*` (next: `tauri-v0.2.3`).
+  Workflow `orca-rs-release.yml` builds the desktop installers + serve-rs.
+  This line still spawns the bundled Node orcad; frozen feature-wise at
+  0.2.2 until the daemon is embedded in-process. The old bare tags
+  `v0.2.1` / `v0.2.2` are this line's history.
+- **Rust line** — branch `rust`, tags `rust-v*` (first: `rust-v0.1.0`).
+  Workflow `orca-daemon-rs-release.yml` builds `orca-daemon-rs` binaries
+  (linux x86_64/aarch64, windows x86_64, macos aarch64). Fase 3 milestone
+  work (M3 onward) lands on this branch.
+- `main` stays the integration branch both lines fork from.

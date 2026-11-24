@@ -1,14 +1,15 @@
 name: orca-rs-release
 
-# Builds the Orca RS artifacts and publishes them to a GitHub Release.
-# - Push to main  -> rolling "dev" prerelease (assets replaced each run)
-# - Push a v* tag -> versioned release
-# - Manual run    -> same as a main push
+# TAURI LINE. Builds the Orca RS Tauri desktop + orca-serve-rs artifacts.
+# - Push to main      -> rolling "dev" prerelease (assets replaced each run)
+# - Push a tauri-v* tag -> versioned Tauri release (e.g. tauri-v0.2.3)
+# - Manual run        -> same as a main push
+# The native Rust daemon line is separate: orca-daemon-rs-release.yml (rust-v*).
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ['tauri-v*']
   workflow_dispatch:
 
 concurrency:
@@ -29,10 +30,10 @@ jobs:
       - id: m
         shell: bash
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          if [[ "$GITHUB_REF" == refs/tags/tauri-v* ]]; then
             echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
-            echo "name=Orca RS $GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "name=Orca RS Tauri ${GITHUB_REF_NAME#tauri-}" >> "$GITHUB_OUTPUT"
           else
             echo "tag=dev" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
@@ -45,7 +46,7 @@ jobs:
           name: ${{ steps.m.outputs.name }}
           prerelease: ${{ steps.m.outputs.prerelease }}
           body: |
-            Orca RS builds — Tauri desktop shell + orca-serve-rs.
+            Orca RS builds — **Tauri line**: desktop shell + orca-serve-rs (this line still spawns the bundled Node orcad runtime). The native Rust daemon is released separately under `rust-v*` tags.
 
             Desktop (Orca RS): bundles the Orca runtime and starts it locally
             on this machine - Windows `.exe` (NSIS) / `.msi`, Linux

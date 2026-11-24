@@ -1,0 +1,96 @@
+name: orca-daemon-rs-release
+
+# RUST LINE. Builds the native Rust daemon (orca-daemon-rs, Fase 3) and
+# publishes the binaries to a GitHub Release.
+# - Push a rust-v* tag -> versioned Rust release (e.g. rust-v0.1.0)
+# - Manual run         -> builds against a rolling "rust-dev" prerelease
+# The Tauri desktop line is separate: orca-rs-release.yml (tauri-v*).
+
+on:
+  push:
+    tags: ['rust-v*']
+  workflow_dispatch:
+
+concurrency:
+  group: orca-daemon-rs-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.m.outputs.tag }}
+      prerelease: ${{ steps.m.outputs.prerelease }}
+      name: ${{ steps.m.outputs.name }}
+    steps:
+      - id: m
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/rust-v* ]]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "name=Orca RS Rust ${GITHUB_REF_NAME#rust-}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=rust-dev" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "name=Orca RS Rust (dev, rolling)" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create the release up front (avoids create-races between jobs)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.m.outputs.tag }}
+          name: ${{ steps.m.outputs.name }}
+          prerelease: ${{ steps.m.outputs.prerelease }}
+          body: |
+            Orca RS builds — **Rust line**: `orca-daemon-rs`, the native Rust
+            daemon (Fase 3). Single binary, no Node, no spawned runtime.
+
+            This is the daemon on its own (server/headless use). The desktop
+            app with this daemon embedded in-process arrives on the Tauri
+            line (`tauri-v*` tags) once Fase 3 integration lands.
+
+  daemon-rs:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux
+            bin: orca-daemon-rs
+          - os: ubuntu-24.04-arm
+            target: aarch64-linux
+            bin: orca-daemon-rs
+          - os: windows-latest
+            target: x86_64-windows
+            bin: orca-daemon-rs.exe
+          - os: macos-latest
+            target: aarch64-macos
+            bin: orca-daemon-rs
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: daemon-rs
+      - name: Build orca-daemon-rs
+        working-directory: daemon-rs
+        run: cargo build --release --locked
+      - name: Package
+        shell: bash
+        run: |
+          cp "daemon-rs/target/release/${{ matrix.bin }}" "orca-daemon-rs-${{ matrix.target }}"
+          sha256sum "orca-daemon-rs-${{ matrix.target }}" > "orca-daemon-rs-${{ matrix.target }}.sha256"
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.name }}
+          prerelease: ${{ needs.meta.outputs.prerelease }}
+          files: |
+            orca-daemon-rs-${{ matrix.target }}
+            orca-daemon-rs-${{ matrix.target }}.sha256
