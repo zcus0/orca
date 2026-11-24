@@ -341,3 +341,34 @@ Two separate lines, separate branches and tag prefixes — never a bare `v*` tag
   `rust-v*`. The integrated app does NOT ship on the Tauri line. Fase 3
   milestone work (M3 onward) lands on this branch.
 - `main` stays the integration branch both lines fork from.
+
+## M4 scoping (2026-11-25, from fork source)
+
+The v62 terminal-daemon protocol lives in `src/main/daemon/protocol/`
+(16 files, ~950 lines; `PROTOCOL_VERSION = 62` in
+daemon-protocol-version.ts). Wire surface to mirror:
+
+- Handshake: daemon-hello-protocol.ts (33 lines).
+- Requests (daemon-rpc-contract.ts): createOrAttach,
+  cancelCreateOrAttach, write, resize, pausePty, resumePty,
+  setSessionBackground, kill, signal, listSessions, shutdownIfIdle,
+  detach, getCwd, clearScrollback, resetInputModes,
+  reportFocusLost, requestRepaint, shutdown, getSnapshot, getSize,
+  takePendingOutput.
+- Stream events (daemon-stream-events.ts): output / resize / clear
+  with per-session output sequence numbers (v57: sequence starts at
+  first attach).
+- Snapshots/history replay: terminal-snapshot.ts,
+  daemon-history-replay-pty.ts, daemon-checkpoint-file.ts.
+
+Architecture note: upstream splits runtime <-> terminal daemon over
+a unix socket (`daemon/daemon-v62.sock`) because the Electron main
+process must not own PTYs. daemon-rs has no such constraint — the
+PTY layer can live in-process (portable-pty) behind the same
+semantics: hello/version gating, create-or-attach with snapshot
+replay, sequenced output streaming. The client-facing side is the
+session/tab RPC graph the web client already speaks to the runtime;
+M4 wires those methods to real PTYs instead of the M3 empty
+inventory. Version-gated behaviours that matter for a fresh daemon:
+v60 requestRepaint, v57 sequence-at-first-attach, v51 fenced
+termination, v31 stable pane attach-only.
