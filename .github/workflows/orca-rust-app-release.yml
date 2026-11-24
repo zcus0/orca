@@ -1,0 +1,107 @@
+name: orca-rust-app-release
+
+# RUST LINE — desktop app. Builds Orca Rust: the Tauri window with
+# the orca-daemon-rs daemon linked in-process (one binary, one
+# runtime, no Node). Publishes the installers into the SAME
+# rust-v* release as orca-daemon-rs-release.yml.
+# - Push a rust-v* tag -> app installers join that release
+# - Manual run         -> builds against a rolling "rust-dev" prerelease
+
+on:
+  push:
+    tags: ['rust-v*']
+  workflow_dispatch:
+
+concurrency:
+  group: orca-rust-app-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.m.outputs.tag }}
+      prerelease: ${{ steps.m.outputs.prerelease }}
+      name: ${{ steps.m.outputs.name }}
+    steps:
+      - id: m
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/rust-v* ]]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "name=Orca RS Rust ${GITHUB_REF_NAME#rust-}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=rust-dev" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "name=Orca RS Rust (dev, rolling)" >> "$GITHUB_OUTPUT"
+          fi
+
+  app:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: nsis,msi
+            artifact_glob: |
+              app-rs/src-tauri/target/release/bundle/nsis/*.exe
+              app-rs/src-tauri/target/release/bundle/msi/*.msi
+          - os: ubuntu-22.04
+            bundles: appimage,deb
+            artifact_glob: |
+              app-rs/src-tauri/target/release/bundle/appimage/*.AppImage
+              app-rs/src-tauri/target/release/bundle/deb/*.deb
+          - os: macos-latest
+            bundles: dmg
+            artifact_glob: |
+              app-rs/src-tauri/target/release/bundle/dmg/*.dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app-rs/src-tauri
+      - name: Linux webview dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2
+      - name: Build the web client (the only frontend input — no orcad, no Node runtime)
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm -C mobile install --frozen-lockfile
+          pnpm build:web
+          pnpm build:mobile-web
+      - name: Assemble the bundled resources (web client only)
+        shell: bash
+        run: |
+          mkdir -p app-rs/resources
+          cp -r out/web app-rs/resources/web
+          du -sh app-rs/resources/*
+      - name: Install the Tauri CLI
+        working-directory: app-rs
+        run: npm install
+      - name: Generate icons from the upstream Orca icon
+        working-directory: app-rs
+        run: npx tauri icon ../resources/build/icon.png
+      - name: Build bundles
+        working-directory: app-rs
+        run: npx tauri build --bundles ${{ matrix.bundles }}
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.name }}
+          prerelease: ${{ needs.meta.outputs.prerelease }}
+          files: ${{ matrix.artifact_glob }}

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "security": { "csp": null },
+    "windows": [
+      {
+        "center": true,
+        "height": 900,
+        "label": "main",
+        "minHeight": 600,
+        "minWidth": 900,
+        "title": "Orca Rust",
+        "width": 1440
+      }
+    ]
+  },
+  "build": { "frontendDist": "../web-placeholder" },
+  "bundle": {
+    "active": true,
+    "category": "DeveloperTool",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "longDescription": "Orca Rust is the full-Rust build of Orca: the daemon (orca-daemon-rs) is linked into the app and runs in-process — one binary, one runtime, no Node, nothing spawned. It uses its own Orca RS profile, separate from the original Orca, so both can run at the same time. Projects and workspaces are served by the Rust daemon; remote Orca servers can still be paired.",
+    "shortDescription": "Orca Rust - full-Rust Orca desktop, daemon in-process",
+    "targets": "all",
+    "windows": { "webviewInstallMode": { "type": "downloadBootstrapper" } }
+  },
+  "identifier": "dev.zcus.orca.rust",
+  "productName": "Orca Rust",
+  "version": "0.2.0"
+}
