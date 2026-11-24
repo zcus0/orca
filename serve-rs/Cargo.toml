@@ -1,0 +1,16 @@
+[package]
+name = "orca-serve-rs"
+version = "0.2.0"
+edition = "2021"
+description = "Rust serve for Orca: supervises the upstream orcad headless server (which natively serves the web client and terminates the E2EE pairing handshake) and transparently proxies HTTP + WebSocket to it."
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio-tungstenite = "0.26"
+
+[profile.release]
+opt-level = 3

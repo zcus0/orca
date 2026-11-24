@@ -1,0 +1,141 @@
+name: orca-rs-release
+
+# Builds the Orca RS artifacts and publishes them to a GitHub Release.
+# - Push to main  -> rolling "dev" prerelease (assets replaced each run)
+# - Push a v* tag -> versioned release
+# - Manual run    -> same as a main push
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: orca-rs-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.m.outputs.tag }}
+      prerelease: ${{ steps.m.outputs.prerelease }}
+      name: ${{ steps.m.outputs.name }}
+    steps:
+      - id: m
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "name=Orca RS $GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=dev" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "name=Orca RS (dev, rolling)" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create the release up front (avoids create-races between jobs)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.m.outputs.tag }}
+          name: ${{ steps.m.outputs.name }}
+          prerelease: ${{ steps.m.outputs.prerelease }}
+          body: |
+            Orca RS builds — Tauri desktop shell + orca-serve-rs.
+
+            Desktop (loads the Orca web client from https://orca.zcus.dev):
+            Windows `.exe` (NSIS) / `.msi`, Linux `.AppImage` / `.deb`, macOS `.dmg`.
+            Server: `orca-serve-rs-*-linux` binaries (x86_64 and aarch64).
+
+            Builds are unsigned: on Windows choose "More info" -> "Run anyway";
+            on macOS right-click the app -> Open.
+
+  serve-rs:
+    needs: meta
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: serve-rs
+      - name: Build orca-serve-rs
+        working-directory: serve-rs
+        run: cargo build --release --locked
+      - name: Package
+        shell: bash
+        run: |
+          cp serve-rs/target/release/orca-serve-rs "orca-serve-rs-${{ matrix.arch }}-linux"
+          sha256sum "orca-serve-rs-${{ matrix.arch }}-linux" > "orca-serve-rs-${{ matrix.arch }}-linux.sha256"
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.name }}
+          prerelease: ${{ needs.meta.outputs.prerelease }}
+          files: |
+            orca-serve-rs-${{ matrix.arch }}-linux
+            orca-serve-rs-${{ matrix.arch }}-linux.sha256
+
+  desktop:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: nsis,msi
+            artifact_glob: |
+              desktop/src-tauri/target/release/bundle/nsis/*.exe
+              desktop/src-tauri/target/release/bundle/msi/*.msi
+          - os: ubuntu-22.04
+            bundles: appimage,deb
+            artifact_glob: |
+              desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+              desktop/src-tauri/target/release/bundle/deb/*.deb
+          - os: macos-latest
+            bundles: dmg
+            artifact_glob: |
+              desktop/src-tauri/target/release/bundle/dmg/*.dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - name: Linux webview dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2
+      - name: Install the Tauri CLI
+        working-directory: desktop
+        run: npm install
+      - name: Generate icons from the upstream Orca icon
+        working-directory: desktop
+        run: npx tauri icon ../resources/build/icon.png
+      - name: Build bundles
+        working-directory: desktop
+        run: npx tauri build --bundles ${{ matrix.bundles }}
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.name }}
+          prerelease: ${{ needs.meta.outputs.prerelease }}
+          files: ${{ matrix.artifact_glob }}
