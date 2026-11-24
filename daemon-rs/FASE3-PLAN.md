@@ -400,9 +400,16 @@ M4 slices:
 1. PTY core (pty.rs): spawn/write/resize/kill, output ring buffer
    with sequence numbers, exit tracking. DONE 2026-11-25 (unit-
    tested against a real shell).
-2. JSON RPC wiring: terminal.create/send/read/list/close/resize
-   with the exact client shapes from terminal-lifecycle-methods.ts
-   and terminal-send-method.ts.
+2. JSON RPC wiring: terminal.create/send/read/list/close with
+   the client shapes from terminal-unary-params.ts (handle-based;
+   send = {text, enter, interrupt} -> {accepted, bytesWritten};
+   read pages the output stream by cursor). DONE 2026-11-25 —
+   worktree selectors (`id:<uuid>`, bare id, or path) resolve to
+   the repo path via the profile catalog; the Terminal object
+   carries the graph-free fields (handle, ptyId, cwd, title,
+   state, createdAt, cols/rows). RPC-level round-trip test drives
+   a real shell (create -> send echo -> read marker -> list ->
+   close). 19/19 tests green.
 3. Streaming: terminal.subscribe + the multiplex binary protocol
    (snapshot on attach, sequenced live frames, ack/flow control,
    resume) — the bit-compat-heavy part.

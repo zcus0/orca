@@ -141,6 +141,7 @@ struct AppState {
     profile: Arc<Profile>,
     registry: Arc<std::sync::Mutex<registry::Registry>>,
     web_root: Option<PathBuf>,
+    pty: Arc<std::sync::Mutex<pty::PtyManager>>,
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
@@ -231,6 +232,7 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
         profile.runtime_id_current.clone(),
         state.registry.clone(),
         profile.dir.clone(),
+        state.pty.clone(),
     );
     let deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
     println!("[daemon-rs] client websocket connected");
@@ -405,7 +407,12 @@ pub async fn start(config: DaemonConfig) -> std::io::Result<RunningDaemon> {
             println!("[daemon-rs] pairing: {url}");
         }
     }
-    let state = AppState { profile: Arc::new(profile), registry, web_root: config.web_root };
+    let state = AppState {
+        profile: Arc::new(profile),
+        registry,
+        web_root: config.web_root,
+        pty: Arc::new(std::sync::Mutex::new(pty::PtyManager::new())),
+    };
     let app = Router::new()
         .route("/__daemon_rs_status", get(status))
         .route("/ws", get(ws_handler))

@@ -39,16 +39,23 @@ pub struct Rpc {
     registry: Arc<Mutex<Registry>>,
     machine_name: String,
     profile_dir: PathBuf,
+    pty: Arc<Mutex<crate::pty::PtyManager>>,
 }
 
 impl Rpc {
-    pub fn new(runtime_id: String, registry: Arc<Mutex<Registry>>, profile_dir: PathBuf) -> Rpc {
+    pub fn new(
+        runtime_id: String,
+        registry: Arc<Mutex<Registry>>,
+        profile_dir: PathBuf,
+        pty: Arc<Mutex<crate::pty::PtyManager>>,
+    ) -> Rpc {
         Rpc {
             runtime_id,
             subscriptions: Vec::new(),
             registry,
             machine_name: machine_name(),
             profile_dir,
+            pty,
         }
     }
 
@@ -87,6 +94,11 @@ impl Rpc {
             "session.tabs.unsubscribeAll" => Ok(Value::Null),
             "pairing.exchangeTicket" => self.exchange_ticket(&params, ctx),
             "pairing.registerDeviceKey" => self.register_device_key(&params, ctx),
+            "terminal.create" => self.terminal_create(&params),
+            "terminal.send" => self.terminal_send(&params),
+            "terminal.read" => self.terminal_read(&params),
+            "terminal.list" => Ok(self.terminal_list(&params)),
+            "terminal.close" => self.terminal_close(&params),
             _ => {
                 return Some(self.failure(
                     &id,
@@ -108,6 +120,145 @@ impl Rpc {
         crate::profile_state::read_domain(&self.profile_dir, "repos")
             .filter(|payload| payload.is_array())
             .unwrap_or_else(|| json!([]))
+    }
+
+    // --- Terminals (M4 slice 2) --------------------------------
+    // The unary terminal.* surface (CLI/automation consumers).
+    // The web client's session-graph + multiplex streaming is
+    // slice 3. Handles are daemon-rs session ids; the Terminal
+    // object carries the fields daemon-rs can honestly fill
+    // without the graph (handle, ptyId, cwd, title, state).
+
+    fn terminal_create(&self, params: &Value) -> Result<Value, String> {
+        let worktree = params.get("worktree").and_then(|v| v.as_str());
+        let cwd = params
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| self.resolve_worktree_path(worktree))
+            .or_else(|| std::env::var("HOME").ok());
+        let env: Vec<(String, String)> = params
+            .get("env")
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let handle = format!("term-{}", crate::registry::uuid());
+        let mut pty = self.pty.lock().map_err(|_| "pty_unavailable")?;
+        pty.spawn(
+            &handle,
+            80,
+            24,
+            cwd.as_deref(),
+            params.get("command").and_then(|v| v.as_str()),
+            if env.is_empty() { None } else { Some(&env) },
+        )?;
+        pty.set_meta(
+            &handle,
+            crate::pty::SessionMeta {
+                worktree: worktree.map(str::to_string),
+                cwd: cwd.clone(),
+                title: params.get("title").and_then(|v| v.as_str()).map(str::to_string),
+                created_at_ms: now_ms(),
+            },
+        );
+        Ok(json!({ "terminal": terminal_json(&handle, &pty) }))
+    }
+
+    fn terminal_send(&self, params: &Value) -> Result<Value, String> {
+        let handle = params
+            .get("terminal")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "invalid_argument".to_string())?;
+        let mut data = Vec::new();
+        if params.get("interrupt").and_then(|v| v.as_bool()) == Some(true) {
+            data.push(0x03);
+        }
+        if let Some(text) = params.get("text").and_then(|v| v.as_str()) {
+            data.extend_from_slice(text.as_bytes());
+        }
+        if params.get("enter").and_then(|v| v.as_bool()) == Some(true) {
+            data.push(b'\r');
+        }
+        let written = data.len();
+        let mut pty = self.pty.lock().map_err(|_| "pty_unavailable")?;
+        pty.write(handle, &data).map_err(|_| "unknown_terminal".to_string())?;
+        Ok(json!({ "handle": handle, "accepted": true, "bytesWritten": written }))
+    }
+
+    fn terminal_read(&self, params: &Value) -> Result<Value, String> {
+        let handle = params
+            .get("terminal")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "invalid_argument".to_string())?;
+        let cursor = params.get("cursor").and_then(|v| v.as_u64()).unwrap_or(0);
+        let pty = self.pty.lock().map_err(|_| "pty_unavailable")?;
+        let (start, bytes, seq) = pty
+            .read(handle, cursor)
+            .map_err(|_| "unknown_terminal".to_string())?;
+        let mut text = String::from_utf8_lossy(&bytes).to_string();
+        if let Some(limit) = params.get("limit").and_then(|v| v.as_u64()) {
+            if text.len() > limit as usize {
+                text = text.chars().take(limit as usize).collect();
+            }
+        }
+        Ok(json!({
+            "terminal": {
+                "handle": handle,
+                "text": text,
+                "cursor": seq,
+                "source": "stream",
+                "truncated": start > cursor,
+            }
+        }))
+    }
+
+    fn terminal_list(&self, params: &Value) -> Value {
+        let worktree = params.get("worktree").and_then(|v| v.as_str());
+        let Ok(pty) = self.pty.lock() else {
+            return json!({ "terminals": [] });
+        };
+        let terminals: Vec<Value> = pty
+            .list()
+            .iter()
+            .filter(|info| {
+                worktree.is_none_or(|w| {
+                    pty.meta(&info.id).and_then(|m| m.worktree.as_deref()) == Some(w)
+                })
+            })
+            .map(|info| terminal_json(&info.id, &pty))
+            .collect();
+        json!({ "terminals": terminals })
+    }
+
+    fn terminal_close(&self, params: &Value) -> Result<Value, String> {
+        let handle = params
+            .get("terminal")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "invalid_argument".to_string())?;
+        let mut pty = self.pty.lock().map_err(|_| "pty_unavailable")?;
+        pty.kill(handle).map_err(|_| "unknown_terminal".to_string())?;
+        Ok(json!({}))
+    }
+
+    /// A worktree selector is a repo id (`id:<uuid>` or the bare
+    /// id) or a filesystem path; resolve it to the repo's path
+    /// via the profile store's catalog.
+    fn resolve_worktree_path(&self, worktree: Option<&str>) -> Option<String> {
+        let selector = worktree?;
+        if std::path::Path::new(selector).is_dir() {
+            return Some(selector.to_string());
+        }
+        let id = selector.strip_prefix("id:").unwrap_or(selector);
+        let repos = self.repo_list();
+        repos
+            .as_array()?
+            .iter()
+            .find(|repo| repo.get("id").and_then(|v| v.as_str()) == Some(id))
+            .and_then(|repo| repo.get("path").and_then(|v| v.as_str()).map(str::to_string))
     }
 
     fn status(&self, params: &Value, ctx: &Ctx) -> Value {
@@ -199,6 +350,34 @@ impl Rpc {
     }
 }
 
+/// The Terminal object for one live session: the fields
+/// daemon-rs can honestly fill without the session graph.
+fn terminal_json(handle: &str, pty: &crate::pty::PtyManager) -> Value {
+    let info = pty.list().into_iter().find(|info| info.id == handle);
+    let meta = pty.meta(handle);
+    json!({
+        "handle": handle,
+        "ptyId": handle,
+        "title": meta.and_then(|m| m.title.clone()),
+        "cwd": meta.and_then(|m| m.cwd.clone()),
+        "worktreeId": meta.and_then(|m| m.worktree.clone()),
+        "state": match info.as_ref().map(|i| i.state) {
+            Some(crate::pty::SessionState::Running) => "running",
+            _ => "exited",
+        },
+        "createdAt": meta.map(|m| m.created_at_ms).unwrap_or(0),
+        "cols": info.as_ref().map(|i| i.cols).unwrap_or(0),
+        "rows": info.as_ref().map(|i| i.rows).unwrap_or(0),
+    })
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Client-generated exchange tokens: 48–128 lowercase hex chars.
 fn is_exchange_token(token: &str) -> bool {
     (48..=128).contains(&token.len())
@@ -240,6 +419,7 @@ mod tests {
             "runtime-test".to_string(),
             Arc::new(Mutex::new(Registry::load(dir.clone()))),
             dir,
+            Arc::new(Mutex::new(crate::pty::PtyManager::new())),
         )
     }
 
@@ -328,6 +508,7 @@ mod tests {
             "runtime-test".to_string(),
             Arc::new(Mutex::new(Registry::load(dir.clone()))),
             dir,
+            Arc::new(Mutex::new(crate::pty::PtyManager::new())),
         );
         let response = rpc
             .handle(r#"{"id":"7","method":"repo.list","params":{}}"#, &anon())
@@ -336,6 +517,62 @@ mod tests {
         assert_eq!(parsed["ok"], true);
         assert_eq!(parsed["result"]["repos"][0]["id"], "r1");
         assert_eq!(parsed["result"]["repos"][0]["displayName"], "a");
+    }
+
+    #[test]
+    fn terminal_round_trip() {
+        let mut rpc = rpc();
+        let response = rpc
+            .handle(r#"{"id":"t1","method":"terminal.create","params":{}}"#, &anon())
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["ok"], true);
+        let handle = parsed["result"]["terminal"]["handle"].as_str().unwrap().to_string();
+        assert_eq!(parsed["result"]["terminal"]["state"], "running");
+        let send = json!({
+            "id": "t2",
+            "method": "terminal.send",
+            "params": { "terminal": handle, "text": "echo rpc-marker", "enter": true },
+        });
+        let response = rpc.handle(&send.to_string(), &anon()).unwrap();
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["result"]["accepted"], true);
+        // Poll the stream read until the shell echoes the marker.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut text = String::new();
+        while std::time::Instant::now() < deadline {
+            let read = json!({
+                "id": "t3",
+                "method": "terminal.read",
+                "params": { "terminal": handle },
+            });
+            let response = rpc.handle(&read.to_string(), &anon()).unwrap();
+            let parsed: Value = serde_json::from_str(&response).unwrap();
+            text = parsed["result"]["terminal"]["text"].as_str().unwrap().to_string();
+            if text.contains("rpc-marker") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(text.contains("rpc-marker"), "read was: {text}");
+        let response = rpc
+            .handle(r#"{"id":"t4","method":"terminal.list","params":{}}"#, &anon())
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["result"]["terminals"].as_array().unwrap().len(), 1);
+        let close = json!({
+            "id": "t5",
+            "method": "terminal.close",
+            "params": { "terminal": handle },
+        });
+        let response = rpc.handle(&close.to_string(), &anon()).unwrap();
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["ok"], true);
+        let response = rpc
+            .handle(r#"{"id":"t6","method":"terminal.list","params":{}}"#, &anon())
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["result"]["terminals"].as_array().unwrap().len(), 0);
     }
 
     #[test]

@@ -87,13 +87,32 @@ struct Session {
     rows: u16,
 }
 
+/// Caller-supplied facts about a session (which workspace it
+/// belongs to, its title) that the PTY itself cannot know.
+#[derive(Clone, Default)]
+pub struct SessionMeta {
+    pub worktree: Option<String>,
+    pub cwd: Option<String>,
+    pub title: Option<String>,
+    pub created_at_ms: u64,
+}
+
 pub struct PtyManager {
     sessions: HashMap<String, Session>,
+    meta: HashMap<String, SessionMeta>,
 }
 
 impl PtyManager {
     pub fn new() -> PtyManager {
-        PtyManager { sessions: HashMap::new() }
+        PtyManager { sessions: HashMap::new(), meta: HashMap::new() }
+    }
+
+    pub fn set_meta(&mut self, session_id: &str, meta: SessionMeta) {
+        self.meta.insert(session_id.to_string(), meta);
+    }
+
+    pub fn meta(&self, session_id: &str) -> Option<&SessionMeta> {
+        self.meta.get(session_id)
     }
 
     /// Spawns `command` (or the platform default shell) in a new
@@ -105,6 +124,7 @@ impl PtyManager {
         rows: u16,
         cwd: Option<&str>,
         command: Option<&str>,
+        env: Option<&[(String, String)]>,
     ) -> Result<(), String> {
         if self.sessions.contains_key(session_id) {
             return Err(format!("session already exists: {session_id}"));
@@ -123,6 +143,11 @@ impl PtyManager {
         };
         if let Some(cwd) = cwd {
             builder.cwd(cwd);
+        }
+        if let Some(env) = env {
+            for (key, value) in env {
+                builder.env(key, value);
+            }
         }
         let child = pair
             .slave
@@ -197,6 +222,7 @@ impl PtyManager {
             .sessions
             .remove(session_id)
             .ok_or_else(|| format!("unknown session: {session_id}"))?;
+        self.meta.remove(session_id);
         let _ = session.child.kill();
         let _ = session.child.wait();
         Ok(())
@@ -274,7 +300,7 @@ mod tests {
     #[test]
     fn spawn_write_read_resize_kill() {
         let mut manager = PtyManager::new();
-        manager.spawn("s1", 80, 24, None, None).unwrap();
+        manager.spawn("s1", 80, 24, None, None, None).unwrap();
         manager.write("s1", b"echo daemon-rs-marker\n").unwrap();
         let text = wait_for(&manager, "s1", "daemon-rs-marker");
         assert!(text.contains("daemon-rs-marker"), "output was: {text}");
@@ -284,7 +310,7 @@ mod tests {
         assert_eq!(infos[0].cols, 120);
         assert_eq!(infos[0].rows, 40);
         assert!(infos[0].output_seq > 0);
-        assert!(manager.spawn("s1", 80, 24, None, None).is_err());
+        assert!(manager.spawn("s1", 80, 24, None, None, None).is_err());
         manager.kill("s1").unwrap();
         assert!(manager.list().is_empty());
         assert!(manager.write("s1", b"x").is_err());
@@ -294,7 +320,7 @@ mod tests {
     fn command_runs_and_exit_is_tracked() {
         let mut manager = PtyManager::new();
         manager
-            .spawn("once", 80, 24, None, Some("echo one-shot-done"))
+            .spawn("once", 80, 24, None, Some("echo one-shot-done"), None)
             .unwrap();
         let text = wait_for(&manager, "once", "one-shot-done");
         assert!(text.contains("one-shot-done"), "output was: {text}");
