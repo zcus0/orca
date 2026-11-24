@@ -9,6 +9,7 @@
 //! (exchangeTicket, registerDeviceKey).
 
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::e2ee::b64_decode_canonical;
@@ -37,15 +38,17 @@ pub struct Rpc {
     subscriptions: Vec<String>,
     registry: Arc<Mutex<Registry>>,
     machine_name: String,
+    profile_dir: PathBuf,
 }
 
 impl Rpc {
-    pub fn new(runtime_id: String, registry: Arc<Mutex<Registry>>) -> Rpc {
+    pub fn new(runtime_id: String, registry: Arc<Mutex<Registry>>, profile_dir: PathBuf) -> Rpc {
         Rpc {
             runtime_id,
             subscriptions: Vec::new(),
             registry,
             machine_name: machine_name(),
+            profile_dir,
         }
     }
 
@@ -68,6 +71,7 @@ impl Rpc {
         let outcome: Result<Value, String> = match method {
             "host.platform" => Ok(json!({ "platform": node_platform() })),
             "host.peerDesktops" => Ok(json!({ "peers": [] })),
+            "repo.list" => Ok(json!({ "repos": self.repo_list() })),
             "status.get" => Ok(self.status(&params, ctx)),
             "runtime.clientCapabilities.update" => Ok(Value::Null),
             "runtime.clientEvents.subscribe" => {
@@ -95,6 +99,15 @@ impl Rpc {
             Ok(result) => self.success(&id, result),
             Err(code) => self.failure(&id, &code, &code),
         })
+    }
+
+    /// The workspace catalog lives in the profile state store as a
+    /// bare JSON array under the `repos` domain; serve it verbatim,
+    /// exactly as orcad does. Absent store/domain = no repos yet.
+    fn repo_list(&self) -> Value {
+        crate::profile_state::read_domain(&self.profile_dir, "repos")
+            .filter(|payload| payload.is_array())
+            .unwrap_or_else(|| json!([]))
     }
 
     fn status(&self, params: &Value, ctx: &Ctx) -> Value {
@@ -225,7 +238,8 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         Rpc::new(
             "runtime-test".to_string(),
-            Arc::new(Mutex::new(Registry::load(dir))),
+            Arc::new(Mutex::new(Registry::load(dir.clone()))),
+            dir,
         )
     }
 
@@ -285,6 +299,43 @@ mod tests {
         let parsed: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed["result"], json!({ "snapshots": [] }));
         assert!(rpc.handle(r#"{"_keepalive":true}"#, &anon()).is_none());
+    }
+
+    #[test]
+    fn repo_list_reads_the_profile_state_store() {
+        let dir =
+            std::env::temp_dir().join(format!("daemon-rs-repos-{}", std::process::id()));
+        let store_dir = dir.join("profiles").join("local-default");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let db_path = store_dir.join("profile-state.db");
+        let _ = std::fs::remove_file(&db_path);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE profile_state_documents (
+                domain TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL,
+                domain_version INTEGER NOT NULL, revision INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL, content_hash TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO profile_state_documents VALUES ('repos', ?1, 1, 1, 0, 'x')",
+            [r#"[{"id":"r1","path":"/tmp/a","displayName":"a","kind":"git"}]"#],
+        )
+        .unwrap();
+        drop(conn);
+        let mut rpc = Rpc::new(
+            "runtime-test".to_string(),
+            Arc::new(Mutex::new(Registry::load(dir.clone()))),
+            dir,
+        );
+        let response = rpc
+            .handle(r#"{"id":"7","method":"repo.list","params":{}}"#, &anon())
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["result"]["repos"][0]["id"], "r1");
+        assert_eq!(parsed["result"]["repos"][0]["displayName"], "a");
     }
 
     #[test]

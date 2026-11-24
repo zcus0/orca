@@ -9,6 +9,7 @@
 
 mod channel;
 mod e2ee;
+mod profile_state;
 mod registry;
 mod rpc;
 
@@ -215,7 +216,11 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
         .map(|registry| registry.devices())
         .unwrap_or_default();
     let mut channel = Channel::new(server_secret, devices);
-    let mut rpc = rpc::Rpc::new(profile.runtime_id_current.clone(), state.registry.clone());
+    let mut rpc = rpc::Rpc::new(
+        profile.runtime_id_current.clone(),
+        state.registry.clone(),
+        profile.dir.clone(),
+    );
     let deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
     println!("[daemon-rs] client websocket connected");
     loop {
