@@ -327,12 +327,17 @@ separate server. Consequences:
 Two separate lines, separate branches and tag prefixes — never a bare `v*` tag again:
 
 - **Tauri line** — branch `tauri`, tags `tauri-v*` (next: `tauri-v0.2.3`).
-  Workflow `orca-rs-release.yml` builds the desktop installers + serve-rs.
-  This line still spawns the bundled Node orcad; frozen feature-wise at
-  0.2.2 until the daemon is embedded in-process. The old bare tags
-  `v0.2.1` / `v0.2.2` are this line's history.
+  Shell swap ONLY: Electron replaced by Tauri, everything else stays
+  upstream — the runtime is still the original Node orcad, bundled and
+  spawned. Workflow `orca-rs-release.yml` builds the desktop installers
+  - serve-rs. The old bare tags `v0.2.1` / `v0.2.2` are this line's
+    history.
 - **Rust line** — branch `rust`, tags `rust-v*` (first: `rust-v0.1.0`).
-  Workflow `orca-daemon-rs-release.yml` builds `orca-daemon-rs` binaries
-  (linux x86_64/aarch64, windows x86_64, macos aarch64). Fase 3 milestone
-  work (M3 onward) lands on this branch.
+  The full Rust rewrite: runtime AND application in Rust. Starts as the
+  standalone `orca-daemon-rs` binary (workflow
+  `orca-daemon-rs-release.yml`: linux x86_64/aarch64, windows x86_64,
+  macos aarch64) and grows into the single-process Rust desktop app —
+  daemon embedded in the app process, zero Node — still released under
+  `rust-v*`. The integrated app does NOT ship on the Tauri line. Fase 3
+  milestone work (M3 onward) lands on this branch.
 - `main` stays the integration branch both lines fork from.

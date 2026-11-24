@@ -46,7 +46,7 @@ jobs:
           name: ${{ steps.m.outputs.name }}
           prerelease: ${{ steps.m.outputs.prerelease }}
           body: |
-            Orca RS builds — **Tauri line**: desktop shell + orca-serve-rs (this line still spawns the bundled Node orcad runtime). The native Rust daemon is released separately under `rust-v*` tags.
+            Orca RS builds — **Tauri line**: shell swap only (Electron -> Tauri) plus orca-serve-rs. The runtime is still the original Node orcad, bundled and spawned. The full Rust rewrite (runtime + application in Rust) is the separate `rust-v*` line.
 
             Desktop (Orca RS): bundles the Orca runtime and starts it locally
             on this machine - Windows `.exe` (NSIS) / `.msi`, Linux

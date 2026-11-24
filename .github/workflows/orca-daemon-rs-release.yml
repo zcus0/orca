@@ -48,9 +48,11 @@ jobs:
             Orca RS builds — **Rust line**: `orca-daemon-rs`, the native Rust
             daemon (Fase 3). Single binary, no Node, no spawned runtime.
 
-            This is the daemon on its own (server/headless use). The desktop
-            app with this daemon embedded in-process arrives on the Tauri
-            line (`tauri-v*` tags) once Fase 3 integration lands.
+            For now this is the daemon on its own (server/headless use).
+            This same line grows into the full Rust application — the daemon
+            embedded in-process in the Rust desktop app, one binary — under
+            `rust-v*` tags. The `tauri-v*` line is only a shell swap and
+            keeps the original Node runtime.
 
   daemon-rs:
     needs: meta
