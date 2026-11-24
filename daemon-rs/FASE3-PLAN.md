@@ -372,3 +372,37 @@ M4 wires those methods to real PTYs instead of the M3 empty
 inventory. Version-gated behaviours that matter for a fresh daemon:
 v60 requestRepaint, v57 sequence-at-first-attach, v51 fenced
 termination, v31 stable pane attach-only.
+
+## M4 map (2026-11-25, from fork source)
+
+Client-facing terminal RPC lives in `src/main/runtime/rpc/methods/
+terminal/` (~50 methods). The core loop the web client needs:
+`terminal.create`, `terminal.send`, `terminal.read`,
+`terminal.list`, `terminal.close`, `terminal.resizeForClient`,
+`terminal.subscribe` / `terminal.multiplex` — output streams back
+as BINARY frames over the sealed channel (the multiplex protocol:
+terminal-multiplex-*.ts, ~20 files: frame delivery, flow control /
+ack windows, initial snapshot, resume ledger). In daemon-rs those
+binary frames are the `Action::RpcBinary` path in channel.rs,
+currently logged and dropped.
+
+Daemon-side (v62) semantics to mirror are in the contract above;
+upstream splits runtime <-> PTY daemon only because Electron main
+must not own PTYs. daemon-rs keeps PTYs in-process
+(`src/pty.rs`, portable-pty). Socket-path doctrine
+(src/main/daemon/AGENTS.md): daemon-rs never publishes or touches
+orcad's canonical `daemon/daemon-v62.sock` path — non-interference
+by design, so a Rust daemon and orcad can coexist on one profile
+host without endpoint fights.
+
+M4 slices:
+
+1. PTY core (pty.rs): spawn/write/resize/kill, output ring buffer
+   with sequence numbers, exit tracking. DONE 2026-11-25 (unit-
+   tested against a real shell).
+2. JSON RPC wiring: terminal.create/send/read/list/close/resize
+   with the exact client shapes from terminal-lifecycle-methods.ts
+   and terminal-send-method.ts.
+3. Streaming: terminal.subscribe + the multiplex binary protocol
+   (snapshot on attach, sequenced live frames, ack/flow control,
+   resume) — the bit-compat-heavy part.
