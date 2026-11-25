@@ -28,6 +28,7 @@
   function dispatch(path, args) {
     if (path === 'platform.get') return boot.platform;
     if (path === 'settings.getSync') return boot.settings;
+    if (path === 'ui.getZoomLevel') return 0;
     const last = path.slice(path.lastIndexOf('.') + 1);
     if (/^on[A-Z]/.test(last) && typeof args[0] === 'function') {
       let set = listeners.get(path);

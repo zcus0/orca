@@ -17,10 +17,18 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
+use tauri_plugin_dialog::DialogExt;
 
 static CALL_LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+/// True while the renderer reports an open tab/worktree
+/// (tracked from session.patchEntries). Closing the window
+/// with a live session asks for confirmation first, like the
+/// original app; closing with nothing open stays instant.
+static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn log_call(path: &str, args: &[serde_json::Value]) {
     if let Ok(mut slot) = CALL_LOG.lock() {
@@ -115,6 +123,17 @@ fn ipc_invoke(
     args: Vec<serde_json::Value>,
 ) -> serde_json::Value {
     log_call(&path, &args);
+    if path == "session.patchEntries" {
+        let active = args
+            .first()
+            .and_then(|a| a.get("fields"))
+            .map(|f| {
+                f.get("activeTabId").is_some_and(|v| !v.is_null())
+                    || f.get("activeWorktreeId").is_some_and(|v| !v.is_null())
+            })
+            .unwrap_or(false);
+        SESSION_ACTIVE.store(active, Ordering::Relaxed);
+    }
     let result = match path.as_str() {
         "settings.get" => state.settings.clone(),
         "repos.list" => domain_or(&state, "repos", empty_list()),
@@ -279,6 +298,12 @@ fn ipc_invoke(
             "gh": { "installed": false, "authenticated": false },
         }),
         "avatarGeneration.capability" => serde_json::json!({ "agents": [] }),
+        "ssh.listRemovedTargetLabels" => serde_json::json!({}),
+        "worktrees.listLineage" => serde_json::json!({
+            "lineage": {},
+            "workspaceLineage": {},
+            "crossStoreLineage": {},
+        }),
         "cache.getGitHub" => serde_json::json!({ "pr": {}, "issue": {} }),
         // runtime.call routes RPC methods to the local
         // runtime; the boot path asks for the bots catalog,
@@ -448,6 +473,94 @@ fn empty_rate_limit_state() -> serde_json::Value {
     })
 }
 
+fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+    let mut it = s.split('.');
+    Some((
+        it.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
+    ))
+}
+
+/// In-app update check (Windows): compare this build against
+/// the newest installer published in the desktop-dev release;
+/// if a newer one exists, ask natively, then download the
+/// setup exe, launch it (it upgrades in place) and exit.
+/// Every failure is silent — an offline or rate-limited
+/// launch must never be disturbed. Runs on a spawned thread.
+#[cfg(target_os = "windows")]
+fn check_for_update(app: tauri::AppHandle) {
+    use tauri_plugin_dialog::MessageDialogButtons;
+    let client = match reqwest::blocking::Client::builder()
+        .user_agent("orca-rust-desktop-updater")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let release: serde_json::Value = match client
+        .get("https://api.github.com/repos/zcus0/orca/releases/tags/desktop-dev")
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json())
+    {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let current = parse_version(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0, 0));
+    let mut best: Option<((u32, u32, u32), String, String)> = None;
+    if let Some(assets) = release.get("assets").and_then(|a| a.as_array()) {
+        for asset in assets {
+            let name = asset.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let Some(vstr) = name
+                .strip_prefix("Orca.Rust.Desktop_")
+                .and_then(|rest| rest.strip_suffix("_x64-setup.exe"))
+            else {
+                continue;
+            };
+            let Some(v) = parse_version(vstr) else { continue };
+            if v > current && best.as_ref().is_none_or(|(bv, _, _)| v > *bv) {
+                if let Some(url) = asset
+                    .get("browser_download_url")
+                    .and_then(|u| u.as_str())
+                {
+                    best = Some((v, vstr.to_string(), url.to_string()));
+                }
+            }
+        }
+    }
+    let Some((_, vstr, url)) = best else { return };
+    let yes = app
+        .dialog()
+        .message(format!(
+            "Orca Rust Desktop {vstr} is available — you have {}. Download and install the update now? The app will close and the installer will take over.",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .title("Update available")
+        .buttons(MessageDialogButtons::YesNo)
+        .blocking_show();
+    if !yes {
+        return;
+    }
+    let dest = std::env::temp_dir().join(format!("OrcaRustDesktop-{vstr}-setup.exe"));
+    let bytes = match client
+        .get(&url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.bytes())
+    {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    if std::fs::write(&dest, &bytes).is_err() {
+        return;
+    }
+    if std::process::Command::new(&dest).spawn().is_ok() {
+        app.exit(0);
+    }
+}
+
 fn main() {
     let profile_dir = orca_daemon_rs::resolve_profile_dir();
     let settings = effective_settings(&profile_dir);
@@ -468,6 +581,38 @@ fn main() {
         format!("desktop-{:x}-{}", nanos, std::process::id())
     };
     tauri::Builder::default()
+        // Single instance: a second launch (or the installer
+        // relaunching the app while it runs) focuses the
+        // existing window instead of spawning another one
+        // that piles up in alt-tab. Must be the first plugin.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_dialog::init())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if SESSION_ACTIVE.load(Ordering::Relaxed) {
+                    api.prevent_close();
+                    let app = window.app_handle().clone();
+                    std::thread::spawn(move || {
+                        let yes = app
+                            .dialog()
+                            .message(
+                                "You have an open workspace session. Quit Orca Rust Desktop anyway?",
+                            )
+                            .title("Quit Orca Rust Desktop?")
+                            .buttons(tauri_plugin_dialog::MessageDialogButtons::YesNo)
+                            .blocking_show();
+                        if yes {
+                            app.exit(0);
+                        }
+                    });
+                }
+            }
+        })
         .manage(BridgeState {
             profile_dir,
             settings,
@@ -506,6 +651,16 @@ fn main() {
             .center()
             .initialization_script(&shim)
             .build()?;
+            // Background update check, a few seconds after the
+            // window is up so the prompt never fights first paint.
+            #[cfg(target_os = "windows")]
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    check_for_update(handle);
+                });
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
