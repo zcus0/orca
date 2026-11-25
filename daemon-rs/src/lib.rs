@@ -17,7 +17,7 @@ mod channel;
 mod e2ee;
 mod graph;
 mod multiplex;
-mod profile_state;
+pub mod profile_state;
 mod pty;
 mod registry;
 mod rpc;
