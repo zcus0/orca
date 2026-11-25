@@ -230,6 +230,7 @@ fn ipc_invoke(
         // string.
         "updater.getStatus" => serde_json::json!({ "state": "idle" }),
         "updater.getVersion" => serde_json::json!(env!("CARGO_PKG_VERSION")),
+        "rateLimits.get" | "rateLimits.refresh" => empty_rate_limit_state(),
         "cache.getGitHub" => serde_json::json!({ "pr": {}, "issue": {} }),
         // runtime.call routes RPC methods to the local
         // runtime; the boot path asks for the bots catalog,
@@ -304,10 +305,104 @@ fn shim_script(settings: &serde_json::Value) -> String {
     include_str!("shim.js").replace("/*__BOOT__*/ null", &boot.to_string())
 }
 
+/// Upstream's default global settings, generated from
+/// src/shared/settings/default-global-settings.ts via
+/// getDefaultSettings() (src/shared/orca-profiles/constants.ts)
+/// and committed as default-settings.json. The real main
+/// process always merges the stored settings over these
+/// defaults, so settings.get never returns a partial object;
+/// the renderer dereferences nested fields (notifications.
+/// enabled, terminalThemeDark.startsWith, ...) unconditionally
+/// and crashes on a bare {} — exactly the 0.4.0–0.4.3 boot
+/// failure.
+fn default_settings() -> serde_json::Value {
+    serde_json::from_str(include_str!("../default-settings.json"))
+        .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// Recursive merge: values from `over` win; when both sides
+/// are objects their keys merge, so a stored partial nested
+/// object still inherits the default's sibling fields.
+fn merge_json(base: &serde_json::Value, over: &serde_json::Value) -> serde_json::Value {
+    match (base, over) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+            let mut out = b.clone();
+            for (k, v) in o {
+                let merged = match out.get(k) {
+                    Some(existing) => merge_json(existing, v),
+                    None => v.clone(),
+                };
+                out.insert(k.clone(), merged);
+            }
+            serde_json::Value::Object(out)
+        }
+        _ => over.clone(),
+    }
+}
+
+/// The settings snapshot the bridge serves: stored profile
+/// settings deep-merged over the upstream defaults. When the
+/// profile never chose a workspace dir, point it at the real
+/// home directory's orca/workspaces like getDefaultSettings
+/// does, instead of the path baked into the generated JSON.
+fn effective_settings(profile_dir: &std::path::Path) -> serde_json::Value {
+    let stored = orca_daemon_rs::profile_state::read_domain(profile_dir, "settings");
+    let stored_has_workspace = stored
+        .as_ref()
+        .and_then(|s| s.get("workspaceDir"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    let mut merged = match &stored {
+        Some(s) => merge_json(&default_settings(), s),
+        None => default_settings(),
+    };
+    if !stored_has_workspace {
+        if let Some(home) = std::env::home_dir() {
+            let sep = std::path::MAIN_SEPARATOR;
+            let dir = format!("{}{}orca{}workspaces", home.display(), sep, sep);
+            if let Some(obj) = merged.as_object_mut() {
+                obj.insert("workspaceDir".into(), serde_json::json!(dir));
+            }
+        }
+    }
+    merged
+}
+
+/// The empty rate-limit state, mirroring upstream's
+/// createEmptyRateLimitState() (src/shared/agent-usage/
+/// rate-limits/rate-limit-state-factory.ts). The status bar's
+/// switcher menu reads .codex/.claude off this object, so a
+/// null answer crashes it.
+fn empty_rate_limit_state() -> serde_json::Value {
+    serde_json::json!({
+        "claude": null,
+        "codex": null,
+        "gemini": null,
+        "opencodeGo": null,
+        "kimi": null,
+        "antigravity": null,
+        "minimax": null,
+        "grok": null,
+        "cursor": null,
+        "zcode": null,
+        "muse": null,
+        "minimaxCookieConfigured": false,
+        "minimaxApiKeyConfigured": false,
+        "opencodeGoApiKeyConfigured": false,
+        "grokAuthConfigured": false,
+        "cursorAuthConfigured": false,
+        "zcodePlanApiKeyConfigured": false,
+        "claudeTarget": { "runtime": "host", "wslDistro": null },
+        "codexTarget": { "runtime": "host", "wslDistro": null },
+        "inactiveClaudeAccounts": [],
+        "inactiveCodexAccounts": [],
+        "antigravityAccounts": [],
+    })
+}
+
 fn main() {
     let profile_dir = orca_daemon_rs::resolve_profile_dir();
-    let settings = orca_daemon_rs::profile_state::read_domain(&profile_dir, "settings")
-        .unwrap_or_else(|| serde_json::json!({}));
+    let settings = effective_settings(&profile_dir);
     let shim = shim_script(&settings);
     let platform = match std::env::consts::OS {
         "windows" => "win32",
