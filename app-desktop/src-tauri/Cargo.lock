@@ -2575,7 +2575,7 @@ dependencies = [
 
 [[package]]
 name = "orca-rust-desktop-app"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "orca-daemon-rs",
  "serde_json",

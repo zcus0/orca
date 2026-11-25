@@ -88,6 +88,13 @@ fn empty_list() -> serde_json::Value {
     serde_json::json!([])
 }
 
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// The one bridge command: every window.api call arrives
 /// here with its dotted path (e.g. "repos.list"). Paths not
 /// yet implemented answer null, and the call log shows
@@ -231,6 +238,25 @@ fn ipc_invoke(
         "updater.getStatus" => serde_json::json!({ "state": "idle" }),
         "updater.getVersion" => serde_json::json!(env!("CARGO_PKG_VERSION")),
         "rateLimits.get" | "rateLimits.refresh" => empty_rate_limit_state(),
+        // Skill discovery: the settings CLI page and the skill
+        // stores read .skills off these results; null crashed
+        // the Command line settings check ("reading 'skills'").
+        "skills.discover" => serde_json::json!({
+            "skills": [],
+            "sources": [],
+            "scannedAt": now_millis(),
+        }),
+        "skills.bundledPlan" => serde_json::json!({
+            "scope": "global",
+            "homeDirectory": std::env::home_dir()
+                .map(|h| h.display().to_string())
+                .unwrap_or_default(),
+            "skills": [],
+            "planDigest": "",
+        }),
+        "speech.getModelStates" => empty_list(),
+        "mobile.listDevices" => empty_list(),
+        "wsl.isAvailable" => serde_json::json!(false),
         "cache.getGitHub" => serde_json::json!({ "pr": {}, "issue": {} }),
         // runtime.call routes RPC methods to the local
         // runtime; the boot path asks for the bots catalog,
