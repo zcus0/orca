@@ -138,6 +138,33 @@ struct BridgeState {
     platform: String,
     rpc: Mutex<orca_daemon_rs::rpc::Rpc>,
     rpc_seq: Mutex<u64>,
+    telemetry_opt_in: Mutex<Option<bool>>,
+}
+
+/// Telemetry consent lives in its own profile-state domain
+/// ("telemetryConsent": {"optIn": bool}); the cache slot
+/// starts unset and loads from the store on first read.
+fn telemetry_opt_in(state: &BridgeState) -> bool {
+    let mut slot = state.telemetry_opt_in.lock().unwrap();
+    if let Some(value) = *slot {
+        return value;
+    }
+    let stored = domain_or(state, "telemetryConsent", serde_json::json!({}));
+    let value = stored
+        .get("optIn")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    *slot = Some(value);
+    value
+}
+
+fn set_telemetry_opt_in(state: &BridgeState, opted_in: bool) {
+    *state.telemetry_opt_in.lock().unwrap() = Some(opted_in);
+    let _ = orca_daemon_rs::profile_state::write_domain(
+        &state.profile_dir,
+        "telemetryConsent",
+        &serde_json::json!({ "optIn": opted_in }),
+    );
 }
 
 fn domain_or(state: &BridgeState, domain: &str, fallback: serde_json::Value) -> serde_json::Value {
@@ -503,8 +530,8 @@ fn ipc_invoke(
         "browser.sessionListProfiles" => empty_list(),
         "browser.sessionDetectBrowsers" => empty_list(),
         "skills.listOwnedShares" => serde_json::json!({
-            "status": "unconfigured",
-            "message": "Skill cloud is not configured",
+            "status": "ok",
+            "value": [],
         }),
         "mobile.listNetworkInterfaces" => serde_json::json!({ "interfaces": [] }),
         "mobile.getRelayStatus" => serde_json::json!({ "status": "offline" }),
@@ -540,6 +567,41 @@ fn ipc_invoke(
             "error": "GitLab is not configured",
         }),
         "pty.management.listSessions" => empty_list(),
+        // --- Settings sweep (0.5.3, from the first real
+        // crash uploads): the Plugins section crashed on
+        // .filter() because listMarketplacePlugins was null;
+        // the remote-server section polls pending migrations;
+        // the Privacy toggle never stuck because the consent
+        // state read was null.
+        "plugins.listMarketplacePlugins" => empty_list(),
+        "plugins.listMarketplaces" => empty_list(),
+        "plugins.refreshMarketplaces" => empty_list(),
+        "runtimeEnvironments.managedOrcad.listPendingMigrations" => empty_list(),
+        "diagnostics.getStatus" => serde_json::json!({
+            "localFileEnabled": false,
+            "bundleEnabled": false,
+            "traceFilePath": "",
+            "traceFamilySize": 0,
+            "disabledReason": "orca_telemetry_disabled",
+        }),
+        "telemetryGetConsentState" => {
+            if telemetry_opt_in(state) {
+                serde_json::json!({ "effective": "enabled" })
+            } else {
+                serde_json::json!({
+                    "effective": "disabled",
+                    "reason": "user_opt_out",
+                })
+            }
+        }
+        "telemetrySetOptIn" => {
+            let opted_in = args
+                .first()
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            set_telemetry_opt_in(state, opted_in);
+            serde_json::Value::Null
+        }
         "cache.getGitHub" => domain_or(
             &state,
             "githubCache",
@@ -916,6 +978,7 @@ fn main() {
             platform,
             rpc: Mutex::new(rpc),
             rpc_seq: Mutex::new(0),
+            telemetry_opt_in: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![ipc_invoke])
         .setup(move |app| {

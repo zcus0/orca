@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "orca-rust-desktop-app"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "orca-daemon-rs",
  "reqwest 0.12.28",
