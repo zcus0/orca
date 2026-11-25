@@ -145,6 +145,15 @@ struct BridgeState {
 /// ("telemetryConsent": {"optIn": bool}); the cache slot
 /// starts unset and loads from the store on first read.
 fn telemetry_opt_in(state: &BridgeState) -> bool {
+    if let Ok(settings) = state.settings.lock() {
+        if let Some(value) = settings
+            .get("telemetry")
+            .and_then(|t| t.get("optedIn"))
+            .and_then(serde_json::Value::as_bool)
+        {
+            return value;
+        }
+    }
     let mut slot = state.telemetry_opt_in.lock().unwrap();
     if let Some(value) = *slot {
         return value;
@@ -160,11 +169,66 @@ fn telemetry_opt_in(state: &BridgeState) -> bool {
 
 fn set_telemetry_opt_in(state: &BridgeState, opted_in: bool) {
     *state.telemetry_opt_in.lock().unwrap() = Some(opted_in);
+    apply_settings_patch(
+        state,
+        &serde_json::json!({ "telemetry": { "optedIn": opted_in } }),
+    );
     let _ = orca_daemon_rs::profile_state::write_domain(
         &state.profile_dir,
         "telemetryConsent",
         &serde_json::json!({ "optIn": opted_in }),
     );
+}
+
+/// Merge a patch into the stored settings document, persist
+/// it, and refresh the effective snapshot. The single write
+/// path for settings.set and for bridge calls that own a
+/// settings subtree (the Privacy pane's toggle reads
+/// settings.telemetry.optedIn, so telemetrySetOptIn must
+/// land here too or the switch never moves).
+fn apply_settings_patch(state: &BridgeState, patch: &serde_json::Value) {
+    let merged_stored = {
+        let mut stored = state
+            .stored_settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let merged = merge_json(&stored, patch);
+        *stored = merged.clone();
+        merged
+    };
+    let _ = orca_daemon_rs::profile_state::write_domain(
+        &state.profile_dir,
+        "settings",
+        &merged_stored,
+    );
+    let effective = effective_from_stored(Some(&merged_stored));
+    if let Ok(mut settings) = state.settings.lock() {
+        *settings = effective;
+    }
+}
+
+/// The Uninstall section's plan when this runtime installed
+/// nothing outside its own app folder: every cleanup step is
+/// already absent, so the section renders its empty state
+/// instead of spinning on a null plan.
+fn uninstall_plan(state: &BridgeState) -> serde_json::Value {
+    let install_kind = match state.platform.as_str() {
+        "win32" => "windows-installer",
+        "darwin" => "mac-app",
+        _ => "linux-appimage",
+    };
+    serde_json::json!({
+        "installKind": install_kind,
+        "agents": [],
+        "cliCommand": null,
+        "backgroundService": null,
+        "hookScripts": null,
+        "hosts": [],
+        "terminalDaemon": null,
+        "otherOrcaBuildName": null,
+        "appPath": null,
+        "removeAppCommand": null,
+    })
 }
 
 fn domain_or(state: &BridgeState, domain: &str, fallback: serde_json::Value) -> serde_json::Value {
@@ -267,24 +331,7 @@ fn ipc_invoke(
         // and serve the re-merged effective snapshot.
         "settings.set" => {
             if let Some(patch) = args.first().filter(|p| p.is_object()) {
-                let merged_stored = {
-                    let mut stored = state
-                        .stored_settings
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let merged = merge_json(&stored, patch);
-                    *stored = merged.clone();
-                    merged
-                };
-                orca_daemon_rs::profile_state::write_domain(
-                    &state.profile_dir,
-                    "settings",
-                    &merged_stored,
-                );
-                let effective = effective_from_stored(Some(&merged_stored));
-                if let Ok(mut settings) = state.settings.lock() {
-                    *settings = effective;
-                }
+                apply_settings_patch(&state, patch);
             }
             serde_json::Value::Null
         }
@@ -602,6 +649,71 @@ fn ipc_invoke(
             set_telemetry_opt_in(&state, opted_in);
             serde_json::Value::Null
         }
+        // --- Accounts + usage (0.6.0): the Settings page is
+        // one boundary — the Accounts section replaced its
+        // state with the null list() result and crashed the
+        // whole page on .accounts (every Settings section
+        // read as "This page hit an error"). Empty states:
+        "claudeAccounts.list" => serde_json::json!({
+            "accounts": [],
+            "activeAccountId": null,
+        }),
+        "codexAccounts.list" => serde_json::json!({
+            "accounts": [],
+            "activeAccountId": null,
+            "activeAccountIdsByRuntime": { "host": null, "wsl": {} },
+        }),
+        "claudeUsage.getScanState" => serde_json::json!({
+            "enabled": true,
+            "isScanning": false,
+            "lastScanStartedAt": null,
+            "lastScanCompletedAt": null,
+            "lastScanError": null,
+            "hasAnyClaudeData": false,
+        }),
+        "codexUsage.getScanState" => serde_json::json!({
+            "enabled": true,
+            "isScanning": false,
+            "lastScanStartedAt": null,
+            "lastScanCompletedAt": null,
+            "lastScanError": null,
+            "hasAnyCodexData": false,
+        }),
+        "openCodeUsage.getScanState" => serde_json::json!({
+            "enabled": true,
+            "isScanning": false,
+            "lastScanStartedAt": null,
+            "lastScanCompletedAt": null,
+            "lastScanError": null,
+            "hasAnyOpenCodeData": false,
+        }),
+        "museUsage.getScanState" => serde_json::json!({
+            "enabled": true,
+            "isScanning": false,
+            "lastScanStartedAt": null,
+            "lastScanCompletedAt": null,
+            "lastScanError": null,
+            "hasAnyMuseData": false,
+        }),
+        // --- Advanced page (0.6.0): the Uninstall section
+        // spun on "Checking what Orca installed…" because
+        // getPlan was null; diagnostics no longer reports a
+        // disabledReason (it rendered as a hard env block
+        // and locked the section's controls).
+        "orcaUninstall.getPlan" => uninstall_plan(state),
+        "orcaUninstall.runStep" => uninstall_plan(state),
+        "diagnostics.getStatus" => serde_json::json!({
+            "localFileEnabled": true,
+            "bundleEnabled": true,
+            "traceFilePath": "",
+            "traceFamilySize": 0,
+        }),
+        "diagnostics.collectBundle" => serde_json::json!({
+            "bundleSubmissionId": "local-bundle",
+            "bytes": 0,
+            "spanCount": 0,
+        }),
+        "diagnostics.uploadBundle" => serde_json::json!({ "canceled": true }),
         "cache.getGitHub" => domain_or(
             &state,
             "githubCache",
@@ -824,15 +936,34 @@ fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
 /// Every failure is silent — an offline or rate-limited
 /// launch must never be disturbed. Runs on a spawned thread.
 #[cfg(target_os = "windows")]
+/// Updater activity goes into the same bridge log the crash
+/// uploads carry, so a silent update failure is diagnosable
+/// from the next crash report instead of invisible.
+fn updater_log(msg: &str) {
+    if let Ok(mut slot) = CALL_LOG.lock() {
+        if let Some(file) = slot.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(file, "updater\t{msg}");
+        }
+    }
+}
+
 fn check_for_update(app: tauri::AppHandle) {
     use tauri_plugin_dialog::MessageDialogButtons;
+    updater_log(&format!(
+        "check start (current {})",
+        env!("CARGO_PKG_VERSION")
+    ));
     let client = match reqwest::blocking::Client::builder()
         .user_agent("orca-rust-desktop-updater")
         .timeout(std::time::Duration::from_secs(30))
         .build()
     {
         Ok(c) => c,
-        Err(_) => return,
+        Err(e) => {
+            updater_log(&format!("client build failed: {e}"));
+            return;
+        }
     };
     let release: serde_json::Value = match client
         .get("https://api.github.com/repos/zcus0/orca/releases/tags/desktop-dev")
@@ -841,7 +972,10 @@ fn check_for_update(app: tauri::AppHandle) {
         .and_then(|r| r.json())
     {
         Ok(v) => v,
-        Err(_) => return,
+        Err(e) => {
+            updater_log(&format!("release fetch failed: {e}"));
+            return;
+        }
     };
     let current = parse_version(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0, 0));
     let mut best: Option<((u32, u32, u32), String, String)> = None;
@@ -865,16 +999,46 @@ fn check_for_update(app: tauri::AppHandle) {
             }
         }
     }
-    let Some((_, vstr, url)) = best else { return };
-    let yes = app
-        .dialog()
-        .message(format!(
-            "Orca Rust Desktop {vstr} is available — you have {}. Download and install the update now? The app will close and the installer will take over.",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .title("Update available")
-        .buttons(MessageDialogButtons::YesNo)
-        .blocking_show();
+    let Some((_, vstr, url)) = best else {
+        updater_log("no newer version found");
+        return;
+    };
+    updater_log(&format!("found {vstr}, asking user"));
+    // The prompt runs on the main thread (the platform-correct
+    // owner for a modal dialog); this worker waits for the
+    // answer with a timeout so a stuck dialog cannot wedge
+    // the update loop.
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let dialog_app = app.clone();
+    let dialog_version = vstr.clone();
+    let shown = app.run_on_main_thread(move || {
+        let mut builder = dialog_app
+            .dialog()
+            .message(format!(
+                "Orca Rust Desktop {dialog_version} is available — you have {}. Download and install the update now? The app will close and the installer will take over.",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .title("Update available")
+            .buttons(MessageDialogButtons::YesNo);
+        if let Some(window) = dialog_app.get_webview_window("main") {
+            builder = builder.parent(&window);
+        }
+        let yes = builder.blocking_show();
+        let _ = tx.send(yes);
+    });
+    let yes = match shown {
+        Ok(()) => rx
+            .recv_timeout(std::time::Duration::from_secs(600))
+            .unwrap_or_else(|_| {
+                updater_log("dialog answer timed out");
+                false
+            }),
+        Err(e) => {
+            updater_log(&format!("dialog dispatch failed: {e}"));
+            false
+        }
+    };
+    updater_log(&format!("user answer: {yes}"));
     if !yes {
         return;
     }
@@ -886,13 +1050,22 @@ fn check_for_update(app: tauri::AppHandle) {
         .and_then(|r| r.bytes())
     {
         Ok(b) => b,
-        Err(_) => return,
+        Err(e) => {
+            updater_log(&format!("download failed: {e}"));
+            return;
+        }
     };
-    if std::fs::write(&dest, &bytes).is_err() {
+    updater_log(&format!("downloaded {} bytes", bytes.len()));
+    if let Err(e) = std::fs::write(&dest, &bytes) {
+        updater_log(&format!("installer write failed: {e}"));
         return;
     }
-    if std::process::Command::new(&dest).spawn().is_ok() {
-        app.exit(0);
+    match std::process::Command::new(&dest).spawn() {
+        Ok(_) => {
+            updater_log("installer launched, exiting");
+            app.exit(0);
+        }
+        Err(e) => updater_log(&format!("installer launch failed: {e}")),
     }
 }
 
@@ -1014,14 +1187,19 @@ fn main() {
             .center()
             .initialization_script(&shim)
             .build()?;
-            // Background update check, a few seconds after the
-            // window is up so the prompt never fights first paint.
+            // Background update checks: first a few seconds
+            // after the window is up so the prompt never
+            // fights first paint, then every 6 hours so a
+            // long-running app still learns about releases.
             #[cfg(target_os = "windows")]
             {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(5));
-                    check_for_update(handle);
+                    loop {
+                        check_for_update(handle.clone());
+                        std::thread::sleep(std::time::Duration::from_secs(6 * 60 * 60));
+                    }
                 });
             }
             Ok(())
