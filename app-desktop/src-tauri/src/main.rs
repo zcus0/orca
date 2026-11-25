@@ -700,8 +700,8 @@ fn ipc_invoke(
         // getPlan was null; diagnostics no longer reports a
         // disabledReason (it rendered as a hard env block
         // and locked the section's controls).
-        "orcaUninstall.getPlan" => uninstall_plan(state),
-        "orcaUninstall.runStep" => uninstall_plan(state),
+        "orcaUninstall.getPlan" => uninstall_plan(&state),
+        "orcaUninstall.runStep" => uninstall_plan(&state),
         "diagnostics.getStatus" => serde_json::json!({
             "localFileEnabled": true,
             "bundleEnabled": true,
@@ -935,7 +935,6 @@ fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
 /// setup exe, launch it (it upgrades in place) and exit.
 /// Every failure is silent — an offline or rate-limited
 /// launch must never be disturbed. Runs on a spawned thread.
-#[cfg(target_os = "windows")]
 /// Updater activity goes into the same bridge log the crash
 /// uploads carry, so a silent update failure is diagnosable
 /// from the next crash report instead of invisible.
@@ -948,6 +947,7 @@ fn updater_log(msg: &str) {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn check_for_update(app: tauri::AppHandle) {
     use tauri_plugin_dialog::MessageDialogButtons;
     updater_log(&format!(
