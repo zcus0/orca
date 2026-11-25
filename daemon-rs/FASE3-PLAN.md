@@ -493,3 +493,29 @@ daemon-rs work for slice 3, in order:
   Input 'echo mux-marker' → Output frame carrying the marker
   (MUX_E2E_OK). Remaining in 3b: the session-graph bridge
   (step 4) so panes render from session.tabs snapshots.
+- 2026-11-25: slice 3b step 4 done — the session-graph bridge
+  (new src/graph.rs). Flat honest subset: one group per
+  worktree, terminal tabs only, each tab a single leaf whose
+  `terminal` is the PTY handle. `session.tabs.createTerminal`
+  spawns a PTY (shared spawn path with terminal.create) and
+  publishes a RuntimeMobileSessionTerminalClientTab
+  {type:'terminal', status:'ready', terminal, ptyId, leafId,
+  parentTabId, isActive} inside a RuntimeMobileSessionTabsResult
+  snapshot (publicationEpoch minted per worktree,
+  snapshotVersion bumps per mutation, tabGroups with tabOrder);
+  `session.tabs.list` / `listAll` serve the same snapshots,
+  `subscribe` answers {type:'snapshot', ...} and
+  `subscribeAll` the inventory (streaming emits approximated
+  by the current snapshot — no live push of graph changes
+  yet), `session.tabs.close` retires tab + PTY, and
+  status.get now reports real liveTabCount/liveLeafCount.
+  The graph lives in AppState, shared across connections.
+  Worktree key = resolved repo path when the selector names a
+  catalog repo, else the selector verbatim. Verified: 23/23
+  cargo tests (new graph cycle test) + live E2E — pair →
+  createTerminal → snapshot carries one ready tab →
+  listAll contains it → multiplex subscribes to its handle →
+  snapshot frames + echo Output (GRAPH_MUX_E2E_OK).
+  M4's remaining acceptance is the real web client run
+  against the zcus6 test deploy (daemon-rs there still runs
+  the M3 build — redeploy before browser testing).

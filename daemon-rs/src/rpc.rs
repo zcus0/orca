@@ -40,6 +40,7 @@ pub struct Rpc {
     machine_name: String,
     profile_dir: PathBuf,
     pty: Arc<Mutex<crate::pty::PtyManager>>,
+    graph: Arc<Mutex<crate::graph::Graph>>,
 }
 
 impl Rpc {
@@ -48,6 +49,7 @@ impl Rpc {
         registry: Arc<Mutex<Registry>>,
         profile_dir: PathBuf,
         pty: Arc<Mutex<crate::pty::PtyManager>>,
+        graph: Arc<Mutex<crate::graph::Graph>>,
     ) -> Rpc {
         Rpc {
             runtime_id,
@@ -56,6 +58,7 @@ impl Rpc {
             machine_name: machine_name(),
             profile_dir,
             pty,
+            graph,
         }
     }
 
@@ -86,11 +89,22 @@ impl Rpc {
                 Ok(Value::Null)
             }
             "runtime.clientEvents.unsubscribe" => Ok(Value::Null),
-            "session.tabs.listAll" => Ok(json!({ "snapshots": [] })),
+            "session.tabs.listAll" => Ok(self.tabs_inventory()),
             "session.tabs.subscribeAll" => {
                 self.subscriptions.push(id.clone());
-                Ok(json!({ "snapshots": [] }))
+                Ok(self.tabs_inventory())
             }
+            "session.tabs.list" => Ok(self.tabs_snapshot(&params)),
+            "session.tabs.subscribe" => {
+                self.subscriptions.push(id.clone());
+                let mut snapshot = self.tabs_snapshot(&params);
+                if let Some(object) = snapshot.as_object_mut() {
+                    object.insert("type".to_string(), json!("snapshot"));
+                }
+                Ok(snapshot)
+            }
+            "session.tabs.createTerminal" => self.tabs_create_terminal(&params),
+            "session.tabs.close" => self.tabs_close(&params),
             "session.tabs.unsubscribeAll" => Ok(Value::Null),
             "pairing.exchangeTicket" => self.exchange_ticket(&params, ctx),
             "pairing.registerDeviceKey" => self.register_device_key(&params, ctx),
@@ -131,6 +145,15 @@ impl Rpc {
     // without the graph (handle, ptyId, cwd, title, state).
 
     fn terminal_create(&self, params: &Value) -> Result<Value, String> {
+        let handle = self.spawn_terminal(params)?;
+        let pty = self.pty.lock().map_err(|_| "pty_unavailable")?;
+        Ok(json!({ "terminal": terminal_json(&handle, &pty) }))
+    }
+
+    /// Spawns a PTY for the shared create params (worktree /
+    /// cwd / command / env / title) and returns its handle.
+    /// Used by terminal.create and session.tabs.createTerminal.
+    fn spawn_terminal(&self, params: &Value) -> Result<String, String> {
         let worktree = params.get("worktree").and_then(|v| v.as_str());
         let cwd = params
             .get("cwd")
@@ -166,7 +189,87 @@ impl Rpc {
                 created_at_ms: now_ms(),
             },
         );
-        Ok(json!({ "terminal": terminal_json(&handle, &pty) }))
+        Ok(handle)
+    }
+
+    // --- Session graph (M4 slice 3b step 4) -------------------
+    // The flat graph subset in crate::graph: createTerminal
+    // spawns a PTY and publishes a terminal tab; list/listAll
+    // serve the snapshots panes render from; close retires
+    // both the tab and its PTY.
+
+    /// The graph key for a worktree selector: the resolved repo
+    /// path when the selector names a catalog repo, else the
+    /// selector verbatim (both sides resolve identically).
+    fn worktree_key(&self, params: &Value) -> Option<String> {
+        let selector = params.get("worktree").and_then(|v| v.as_str())?;
+        Some(self.resolve_worktree_path(Some(selector)).unwrap_or_else(|| selector.to_string()))
+    }
+
+    fn tabs_inventory(&self) -> Value {
+        let Ok(graph) = self.graph.lock() else {
+            return json!({ "snapshots": [] });
+        };
+        graph.inventory()
+    }
+
+    fn tabs_snapshot(&self, params: &Value) -> Value {
+        let Some(key) = self.worktree_key(params) else {
+            return json!({
+                "worktree": "",
+                "publicationEpoch": "none",
+                "snapshotVersion": 0,
+                "activeGroupId": Value::Null,
+                "activeTabId": Value::Null,
+                "activeTabType": Value::Null,
+                "tabs": [],
+            });
+        };
+        let Ok(graph) = self.graph.lock() else {
+            return json!({ "snapshots": [] });
+        };
+        graph.snapshot(&key)
+    }
+
+    fn tabs_create_terminal(&self, params: &Value) -> Result<Value, String> {
+        let Some(key) = self.worktree_key(params) else {
+            return Err("invalid_argument".to_string());
+        };
+        let handle = self.spawn_terminal(params)?;
+        let title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Terminal")
+            .to_string();
+        let cwd = params
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| self.resolve_worktree_path(params.get("worktree").and_then(|v| v.as_str())));
+        let mut graph = self.graph.lock().map_err(|_| "graph_unavailable")?;
+        let (_tab_id, snapshot) = graph.add_terminal(&key, title, handle, cwd);
+        Ok(snapshot)
+    }
+
+    fn tabs_close(&self, params: &Value) -> Result<Value, String> {
+        let Some(key) = self.worktree_key(params) else {
+            return Err("invalid_argument".to_string());
+        };
+        let tab_id = params
+            .get("tabId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "invalid_argument".to_string())?;
+        let removed = {
+            let mut graph = self.graph.lock().map_err(|_| "graph_unavailable")?;
+            graph.close_tab(&key, tab_id)
+        };
+        let Some((handle, _snapshot)) = removed else {
+            return Err("unknown_tab".to_string());
+        };
+        if let Ok(mut pty) = self.pty.lock() {
+            let _ = pty.kill(&handle);
+        }
+        Ok(json!({ "closed": true }))
     }
 
     fn terminal_send(&self, params: &Value) -> Result<Value, String> {
@@ -266,13 +369,18 @@ impl Rpc {
         if params.get("probe").and_then(|v| v.as_bool()) == Some(true) {
             return json!({ "runtimeId": self.runtime_id });
         }
+        let (live_tabs, live_leaves) = self
+            .graph
+            .lock()
+            .map(|graph| graph.counts())
+            .unwrap_or((0, 0));
         let mut status = json!({
             "runtimeId": self.runtime_id,
             "rendererGraphEpoch": 0,
             "graphStatus": "ready",
             "authoritativeWindowId": Value::Null,
-            "liveTabCount": 0,
-            "liveLeafCount": 0,
+            "liveTabCount": live_tabs,
+            "liveLeafCount": live_leaves,
             "runtimeProtocolVersion": RUNTIME_PROTOCOL_VERSION,
             "minCompatibleRuntimeClientVersion": MIN_COMPATIBLE_CLIENT_VERSION,
             "capabilities": CAPABILITIES,
@@ -421,6 +529,7 @@ mod tests {
             Arc::new(Mutex::new(Registry::load(dir.clone()))),
             dir,
             Arc::new(Mutex::new(crate::pty::PtyManager::new())),
+            Arc::new(Mutex::new(crate::graph::Graph::new())),
         )
     }
 
@@ -510,6 +619,7 @@ mod tests {
             Arc::new(Mutex::new(Registry::load(dir.clone()))),
             dir,
             Arc::new(Mutex::new(crate::pty::PtyManager::new())),
+            Arc::new(Mutex::new(crate::graph::Graph::new())),
         );
         let response = rpc
             .handle(r#"{"id":"7","method":"repo.list","params":{}}"#, &anon())

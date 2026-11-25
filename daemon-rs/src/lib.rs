@@ -14,6 +14,7 @@
 
 mod channel;
 mod e2ee;
+mod graph;
 mod multiplex;
 mod profile_state;
 mod pty;
@@ -144,6 +145,7 @@ struct AppState {
     registry: Arc<std::sync::Mutex<registry::Registry>>,
     web_root: Option<PathBuf>,
     pty: Arc<std::sync::Mutex<pty::PtyManager>>,
+    graph: Arc<std::sync::Mutex<graph::Graph>>,
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
@@ -281,6 +283,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
         state.registry.clone(),
         profile.dir.clone(),
         state.pty.clone(),
+        state.graph.clone(),
     );
     let mut mux = multiplex::Multiplex::new(state.pty.clone(), outbound.clone());
     let deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
@@ -479,6 +482,7 @@ pub async fn start(config: DaemonConfig) -> std::io::Result<RunningDaemon> {
         registry,
         web_root: config.web_root,
         pty: Arc::new(std::sync::Mutex::new(pty::PtyManager::new())),
+        graph: Arc::new(std::sync::Mutex::new(graph::Graph::new())),
     };
     let app = Router::new()
         .route("/__daemon_rs_status", get(status))
