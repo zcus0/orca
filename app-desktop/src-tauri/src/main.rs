@@ -172,6 +172,74 @@ fn ipc_invoke(
         }),
         "ssh.importConfig" => serde_json::json!({}),
 
+        // --- Second boot iteration (0.4.1 run's log,
+        // 2026-11-25): the boot chain now completes, but the
+        // worktree sidebar render dies on
+        // "Cannot read properties of undefined (reading
+        // 'startsWith')" because session.get answered null.
+        // The persisted session lives in the profile-state
+        // store under the "workspaceSession" domain (see
+        // src/main/persistence/workspace-session-domains.ts);
+        // serve it verbatim, with a minimal valid state as
+        // fallback (required fields per
+        // workspace-session-state-types.ts).
+        "session.get" => domain_or(
+            &state,
+            "workspaceSession",
+            serde_json::json!({
+                "activeRepoId": null,
+                "activeWorktreeId": null,
+                "activeTabId": null,
+                "tabsByWorktree": {},
+                "terminalLayoutsByTabId": {},
+            }),
+        ),
+        "session.listHostIds" => empty_list(),
+        // The updater store reads `.state` off getStatus —
+        // null crashed it ("reading 'state'"). {state:'idle'}
+        // is the valid no-update state; getVersion is a plain
+        // string.
+        "updater.getStatus" => serde_json::json!({ "state": "idle" }),
+        "updater.getVersion" => serde_json::json!(env!("CARGO_PKG_VERSION")),
+        "cache.getGitHub" => serde_json::json!({ "pr": {}, "issue": {} }),
+        // runtime.call routes RPC methods to the local
+        // runtime; the boot path asks for the bots catalog,
+        // whose result shapes are {bots:[...]} / {groups:[]}
+        // (component-fixtures/fixture-bots.ts). Other methods
+        // get an empty object rather than null for now.
+        "runtime.call" => {
+            let method = args
+                .first()
+                .and_then(|a| a.get("method"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            match method {
+                "bots.list" => serde_json::json!({ "bots": [] }),
+                "bots.groups.list" => serde_json::json!({ "groups": [] }),
+                _ => serde_json::json!({}),
+            }
+        }
+        "linear.status" => serde_json::json!({
+            "connected": false,
+            "viewer": null,
+        }),
+        // Plain booleans the boot path probes.
+        "app.holdsStructuredAgentSessions"
+        | "ui.isMaximized"
+        | "backgroundWorker.isPaused"
+        | "agentStatus.hasRestartOffers"
+        | "pwsh.isAvailable"
+        | "gitBash.isAvailable" => serde_json::json!(false),
+        // More boot-path lists that must not be null.
+        "wsl.listDistros"
+        | "ssh.listTargets"
+        | "runtime.getBrowserRemoteViewerPages"
+        | "runtimeEnvironments.portForwards.list"
+        | "runtimeEnvironments.portForwards.takeRestoredMoves"
+        | "ephemeralVm.listPendingCheckouts"
+        | "ephemeralVm.listRuntimes"
+        | "plugins.takeRequiredPluginFailures" => empty_list(),
+
         _ => serde_json::Value::Null,
     }
 }
