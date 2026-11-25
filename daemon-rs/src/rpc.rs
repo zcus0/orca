@@ -95,6 +95,7 @@ impl Rpc {
             "pairing.exchangeTicket" => self.exchange_ticket(&params, ctx),
             "pairing.registerDeviceKey" => self.register_device_key(&params, ctx),
             "terminal.create" => self.terminal_create(&params),
+            "terminal.multiplex" => Ok(json!({ "type": "ready" })),
             "terminal.send" => self.terminal_send(&params),
             "terminal.read" => self.terminal_read(&params),
             "terminal.list" => Ok(self.terminal_list(&params)),

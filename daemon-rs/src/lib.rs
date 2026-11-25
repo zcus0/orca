@@ -14,6 +14,7 @@
 
 mod channel;
 mod e2ee;
+mod multiplex;
 mod profile_state;
 mod pty;
 mod registry;
@@ -217,7 +218,7 @@ const HANDSHAKE_DEADLINE: Duration = Duration::from_millis(10_000);
 /// writer task's queue. The handshake/RPC loop uses the same path,
 /// so every outbound frame funnels through one writer.
 #[derive(Clone)]
-struct Outbound {
+pub(crate) struct Outbound {
     channel: Arc<std::sync::Mutex<Channel>>,
     queue: tokio::sync::mpsc::Sender<Message>,
 }
@@ -225,7 +226,7 @@ struct Outbound {
 impl Outbound {
     /// Seals one binary payload (a terminal stream frame) and
     /// queues it for the writer. False = the connection is gone.
-    async fn send_binary(&self, plaintext: &[u8]) -> bool {
+    pub(crate) async fn send_binary(&self, plaintext: &[u8]) -> bool {
         let sealed = self
             .channel
             .lock()
@@ -239,7 +240,7 @@ impl Outbound {
 
     /// Queues an already-framed text message (handshake replies
     /// and sealed auth frames travel unsealed-or-presealed).
-    async fn send_text(&self, text: String) -> bool {
+    pub(crate) async fn send_text(&self, text: String) -> bool {
         self.queue.send(Message::Text(text.into())).await.is_ok()
     }
 }
@@ -281,6 +282,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
         profile.dir.clone(),
         state.pty.clone(),
     );
+    let mut mux = multiplex::Multiplex::new(state.pty.clone(), outbound.clone());
     let deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
     println!("[daemon-rs] client websocket connected");
     loop {
@@ -370,7 +372,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                     }
                 }
                 Action::RpcBinary(bytes) => {
-                    println!("[daemon-rs] rpc binary (M4): {} bytes", bytes.len());
+                    mux.on_binary(&bytes).await;
                 }
             }
         }
@@ -378,6 +380,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
             break;
         }
     }
+    mux.shutdown();
     drop(outbound);
     drop(queue_tx);
     let _ = writer.await;

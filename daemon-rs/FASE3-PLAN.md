@@ -472,3 +472,24 @@ daemon-rs work for slice 3, in order:
   (emit {type:'ready'}, binary control handler on streamId 0)
   - Subscribe/Input/Resize/Unsubscribe frame handling (step 3),
     then the session-graph bridge (step 4).
+- 2026-11-25: slice 3b step 2 done — the multiplex itself
+  (new src/multiplex.rs). `terminal.multiplex` answers the
+  standard envelope with result {type:'ready'} (the streaming
+  method's first emit, per the client transport fixtures);
+  binary frames then route per connection: Subscribe on
+  streamId 0 (payload names streamId + terminal; viewport
+  resizes first) → SnapshotStart {kind:'scrollback'} /
+  SnapshotChunk (≤64 KiB) / SnapshotEnd from the ring buffer,
+  then a 40 ms pump task streams Output frames with per-stream
+  sequence numbers; Input writes to the PTY, Resize /
+  ClaimViewport resize it, Unsubscribe aborts the pump,
+  SnapshotRequest re-sends the snapshot, Ack / SetOutputPaused
+  / SetOutputCadence are accepted and ignored. Subset limits:
+  no outputAck credit-window enforcement, no resume ledger,
+  no viewport-claim arbitration. Verified E2E against the live
+  binary with an independent Node client (tweetnacl +
+  node hkdfSync, transcript mirrored from e2ee.rs): pair →
+  terminal.create → multiplex ready → snapshot opcodes 2,3,4 →
+  Input 'echo mux-marker' → Output frame carrying the marker
+  (MUX_E2E_OK). Remaining in 3b: the session-graph bridge
+  (step 4) so panes render from session.tabs snapshots.
