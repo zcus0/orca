@@ -1,6 +1,6 @@
 [package]
 name = "orca-rust-desktop-app"
-version = "0.5.1"
+version = "0.5.2"
 description = "Orca Rust Desktop (Fase 4) - the upstream desktop renderer running on the Rust runtime in-process, no server"
 edition = "2021"
 
