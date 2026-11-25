@@ -95,6 +95,14 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 /// The one bridge command: every window.api call arrives
 /// here with its dotted path (e.g. "repos.list"). Paths not
 /// yet implemented answer null, and the call log shows
@@ -110,13 +118,7 @@ fn ipc_invoke(
     let result = match path.as_str() {
         "settings.get" => state.settings.clone(),
         "repos.list" => domain_or(&state, "repos", empty_list()),
-        "repos.isGitAvailable" => serde_json::json!(
-            std::process::Command::new("git")
-                .arg("--version")
-                .output()
-                .map(|out| out.status.success())
-                .unwrap_or(false)
-        ),
+        "repos.isGitAvailable" => serde_json::json!(git_available()),
         "app.quit" => {
             app.exit(0);
             serde_json::Value::Null
@@ -257,6 +259,26 @@ fn ipc_invoke(
         "speech.getModelStates" => empty_list(),
         "mobile.listDevices" => empty_list(),
         "wsl.isAvailable" => serde_json::json!(false),
+        // Caffeinate status-bar segment: it stores this result
+        // as its state and renders .mode off it — null crashed
+        // the status bar ("reading 'mode'") in 0.4.5.
+        "agentAwake.getStatus" => serde_json::json!({ "mode": "off", "active": false }),
+        "plugins.statusBarState" => serde_json::json!({}),
+        "memory.resourceWindowVisible" => serde_json::json!(false),
+        "legacyRelayBridge.listPanes" => empty_list(),
+        "preflight.detectAgents" => empty_list(),
+        "preflight.refreshAgents" => serde_json::json!({
+            "agents": [],
+            "addedPathSegments": [],
+            "shellHydrationOk": false,
+            "pathSource": "sync_seed_only",
+            "pathFailureReason": "none",
+        }),
+        "preflight.check" => serde_json::json!({
+            "git": { "installed": git_available() },
+            "gh": { "installed": false, "authenticated": false },
+        }),
+        "avatarGeneration.capability" => serde_json::json!({ "agents": [] }),
         "cache.getGitHub" => serde_json::json!({ "pr": {}, "issue": {} }),
         // runtime.call routes RPC methods to the local
         // runtime; the boot path asks for the bots catalog,
