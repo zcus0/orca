@@ -18,6 +18,7 @@ mod profile_state;
 mod pty;
 mod registry;
 mod rpc;
+mod stream;
 
 use std::path::PathBuf;
 use std::sync::Arc;
