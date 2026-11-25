@@ -73,7 +73,7 @@ fn ipc_invoke(
     log_call(&path, &args);
     match path.as_str() {
         "settings.get" => state.settings.clone(),
-        "repos.list" => domain_or(state, "repos", empty_list()),
+        "repos.list" => domain_or(&state, "repos", empty_list()),
         "repos.isGitAvailable" => serde_json::json!(
             std::process::Command::new("git")
                 .arg("--version")
@@ -91,8 +91,8 @@ fn ipc_invoke(
         // upstream preload API types; lists the local runtime
         // does not have yet answer as empty lists instead of
         // null, which the renderer does not survive.
-        "ui.get" => domain_or(state, "ui", serde_json::json!({})),
-        "projects.list" => match domain_or(state, "projects", empty_list()) {
+        "ui.get" => domain_or(&state, "ui", serde_json::json!({})),
+        "projects.list" => match domain_or(&state, "projects", empty_list()) {
             value if value.is_array() => value,
             _ => empty_list(),
         },
