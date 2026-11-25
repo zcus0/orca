@@ -22,21 +22,41 @@ use tauri::Manager;
 
 static CALL_LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
-fn log_call(path: &str, argc: usize) {
+fn log_call(path: &str, args: &[serde_json::Value]) {
     if let Ok(mut slot) = CALL_LOG.lock() {
         if let Some(file) = slot.as_mut() {
-            let _ = writeln!(file, "{path}\t{argc}");
+            // Args are logged (truncated, single line) because the
+            // renderer reports its own crashes through
+            // crashReports.recordRendererError — the message only
+            // exists in the args.
+            let summary = serde_json::to_string(args)
+                .unwrap_or_default()
+                .replace(['\n', '\r', '\t'], " ");
+            let summary: String = summary.chars().take(600).collect();
+            let _ = writeln!(file, "{path}\t{}\t{summary}", args.len());
             let _ = file.flush();
         }
     }
 }
 
-/// Local state the bridge answers from: the RS profile dir
-/// and the settings snapshot read at startup (the same
-/// snapshot the shim's synchronous settings read returns).
+/// Local state the bridge answers from: the RS profile dir,
+/// the settings snapshot read at startup (the same snapshot
+/// the shim's synchronous settings read returns), a per-run
+/// runtime id for runtime.getStatus, and the Node-style
+/// platform string ("win32" / "darwin" / "linux").
 struct BridgeState {
     profile_dir: PathBuf,
     settings: serde_json::Value,
+    runtime_id: String,
+    platform: String,
+}
+
+fn domain_or(state: &BridgeState, domain: &str, fallback: serde_json::Value) -> serde_json::Value {
+    orca_daemon_rs::profile_state::read_domain(&state.profile_dir, domain).unwrap_or(fallback)
+}
+
+fn empty_list() -> serde_json::Value {
+    serde_json::json!([])
 }
 
 /// The one bridge command: every window.api call arrives
@@ -50,11 +70,10 @@ fn ipc_invoke(
     path: String,
     args: Vec<serde_json::Value>,
 ) -> serde_json::Value {
-    log_call(&path, args.len());
+    log_call(&path, &args);
     match path.as_str() {
         "settings.get" => state.settings.clone(),
-        "repos.list" => orca_daemon_rs::profile_state::read_domain(&state.profile_dir, "repos")
-            .unwrap_or_else(|| serde_json::json!([])),
+        "repos.list" => domain_or(state, "repos", empty_list()),
         "repos.isGitAvailable" => serde_json::json!(
             std::process::Command::new("git")
                 .arg("--version")
@@ -66,6 +85,93 @@ fn ipc_invoke(
             app.exit(0);
             serde_json::Value::Null
         }
+
+        // --- Boot-path answers (from the first real run's
+        // shim-calls.log, 2026-11-25). Shapes follow the
+        // upstream preload API types; lists the local runtime
+        // does not have yet answer as empty lists instead of
+        // null, which the renderer does not survive.
+        "ui.get" => domain_or(state, "ui", serde_json::json!({})),
+        "projects.list" => match domain_or(state, "projects", empty_list()) {
+            value if value.is_array() => value,
+            _ => empty_list(),
+        },
+        "runtime.getStatus" => serde_json::json!({
+            "runtimeId": state.runtime_id,
+            "rendererGraphEpoch": 0,
+            "graphStatus": "ready",
+            "authoritativeWindowId": null,
+            "liveTabCount": 0,
+            "liveLeafCount": 0,
+            "runtimeProtocolVersion": 3,
+            "minCompatibleRuntimeClientVersion": 2,
+            "capabilities": [],
+            "appVersion": env!("CARGO_PKG_VERSION"),
+            "hostPlatform": state.platform,
+        }),
+        "runtime.getTerminalDrivers"
+        | "runtime.getBrowserDrivers"
+        | "runtime.getTerminalFitOverrides"
+        | "runtime.getClientHostedBrowserRows"
+        | "runtimeEnvironments.list"
+        | "runtimeEnvironments.getStatusSnapshots"
+        | "plugins.list"
+        | "plugins.listThemes"
+        | "plugins.listTerminalThemes"
+        | "plugins.listIconThemes"
+        | "plugins.takeUpdateReviewNotices"
+        | "projects.listHostSetups"
+        | "projectGroups.list"
+        | "folderWorkspaces.list"
+        | "repos.listWslMoved"
+        | "repos.listHostCatalogSnapshots"
+        | "wslMove.listPendingRendererRewrites"
+        | "wslDriveUnc.listPendingRendererRewrites" => empty_list(),
+        "session.desktopRelaysVersion" => serde_json::json!(0),
+        "onboarding.get" => serde_json::json!({
+            "flowVersion": 1,
+            "closedAt": null,
+            "outcome": null,
+            "lastCompletedStep": -1,
+            "checklist": {},
+        }),
+        "keybindings.get" => serde_json::json!({
+            "path": "",
+            "platform": state.platform,
+            "exists": false,
+            "overrides": {},
+            "commonOverrides": {},
+            "platformOverrides": {},
+            "diagnostics": [],
+        }),
+        "orcaProfiles.authStatus" => serde_json::json!({
+            "activeProfileId": "",
+            "configured": false,
+            "state": "unconfigured",
+            "persistence": "none",
+        }),
+        "orcaProfiles.list" => serde_json::json!({
+            "status": "unconfigured",
+            "auth": {
+                "activeProfileId": "",
+                "configured": false,
+                "state": "unconfigured",
+                "persistence": "none",
+            },
+            "activeProfileId": "",
+            "profiles": [],
+            "multiProfileUi": false,
+        }),
+        "plugins.getAutoUpdateState" => serde_json::json!({
+            "updated": {},
+            "needsReview": {},
+        }),
+        "jira.status" => serde_json::json!({
+            "connected": false,
+            "viewer": null,
+        }),
+        "ssh.importConfig" => serde_json::json!({}),
+
         _ => serde_json::Value::Null,
     }
 }
@@ -104,8 +210,28 @@ fn main() {
     let settings = orca_daemon_rs::profile_state::read_domain(&profile_dir, "settings")
         .unwrap_or_else(|| serde_json::json!({}));
     let shim = shim_script(&settings);
+    let platform = match std::env::consts::OS {
+        "windows" => "win32",
+        "macos" => "darwin",
+        other => other,
+    }
+    .to_string();
+    // A per-run id is all runtime.getStatus needs; it does not
+    // have to survive restarts.
+    let runtime_id = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("desktop-{:x}-{}", nanos, std::process::id())
+    };
     tauri::Builder::default()
-        .manage(BridgeState { profile_dir, settings })
+        .manage(BridgeState {
+            profile_dir,
+            settings,
+            runtime_id,
+            platform,
+        })
         .invoke_handler(tauri::generate_handler![ipc_invoke])
         .setup(move |app| {
             if let Ok(dir) = app.path().app_data_dir() {
