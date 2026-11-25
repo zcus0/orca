@@ -87,6 +87,13 @@ impl Channel {
         self.session.as_mut().map(|session| session.seal_text(plaintext))
     }
 
+    /// Seals an outbound binary frame (terminal stream frames)
+    /// with the session. The wire form is the raw sealed frame —
+    /// binary frames are not base64-wrapped (see e2ee framing).
+    pub fn seal_binary(&mut self, plaintext: &[u8]) -> Option<Vec<u8>> {
+        self.session.as_mut().map(|session| session.seal_binary(plaintext))
+    }
+
     pub fn on_text(&mut self, raw: &str) -> Vec<Action> {
         if self.state == State::AwaitingHello {
             return self.handle_hello(raw);

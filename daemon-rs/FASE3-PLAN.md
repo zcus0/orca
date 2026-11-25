@@ -452,3 +452,23 @@ daemon-rs work for slice 3, in order:
 4. Session graph bridge: terminals created via terminal.create
    must appear in session.tabs snapshots for the web client to
    render panes at all (overlaps M3's remaining graph work).
+
+## M4 progress
+
+- 2026-11-25: slice 3a done — the multiplex frame codec
+  (src/stream.rs), byte-exact against terminal-stream-protocol.ts
+  with golden-vector tests. 22/22 cargo tests green.
+- 2026-11-25: slice 3b step 1 done — the WS loop refactor
+  (scoping item 1 above). handle_ws now splits the socket, runs
+  a writer task draining an mpsc queue, and shares the E2EE
+  channel behind a mutex; the `Outbound` handle lets background
+  producers seal binary frames (new `Channel::seal_binary`,
+  over the existing DesktopSession::seal_binary) and push them
+  outside request/response. Handshake deadline, auth actions and
+  RPC replies all funnel through the queue. Verified: cargo
+  build clean, 22/22 tests green, live smoke — a raw WS client
+  completed the v2 hello → ready exchange against the rebuilt
+  binary. Next in 3b: terminal.multiplex as a streaming method
+  (emit {type:'ready'}, binary control handler on streamId 0)
+  - Subscribe/Input/Resize/Unsubscribe frame handling (step 3),
+    then the session-graph bridge (step 4).

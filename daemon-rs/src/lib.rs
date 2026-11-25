@@ -211,16 +211,61 @@ async fn static_file(uri: axum::http::Uri, State(state): State<AppState>) -> imp
 /// Upstream's paired handshake deadline (paired-e2ee-handshake-deadline).
 const HANDSHAKE_DEADLINE: Duration = Duration::from_millis(10_000);
 
-async fn handle_ws(mut socket: WebSocket, state: AppState) {
+/// The push side of one client connection: background producers
+/// (terminal output pumps, M4 slice 3b) seal binary stream frames
+/// through the shared channel and hand the wire bytes to the
+/// writer task's queue. The handshake/RPC loop uses the same path,
+/// so every outbound frame funnels through one writer.
+#[derive(Clone)]
+struct Outbound {
+    channel: Arc<std::sync::Mutex<Channel>>,
+    queue: tokio::sync::mpsc::Sender<Message>,
+}
+
+impl Outbound {
+    /// Seals one binary payload (a terminal stream frame) and
+    /// queues it for the writer. False = the connection is gone.
+    async fn send_binary(&self, plaintext: &[u8]) -> bool {
+        let sealed = self
+            .channel
+            .lock()
+            .ok()
+            .and_then(|mut channel| channel.seal_binary(plaintext));
+        match sealed {
+            Some(bytes) => self.queue.send(Message::Binary(bytes.into())).await.is_ok(),
+            None => false,
+        }
+    }
+
+    /// Queues an already-framed text message (handshake replies
+    /// and sealed auth frames travel unsealed-or-presealed).
+    async fn send_text(&self, text: String) -> bool {
+        self.queue.send(Message::Text(text.into())).await.is_ok()
+    }
+}
+
+async fn handle_ws(socket: WebSocket, state: AppState) {
     let profile = state.profile.clone();
+    let (mut sink, mut stream) = socket.split();
+    let (queue_tx, mut queue_rx) = tokio::sync::mpsc::channel::<Message>(256);
+    let writer = tokio::spawn(async move {
+        while let Some(message) = queue_rx.recv().await {
+            if sink.send(message).await.is_err() {
+                break;
+            }
+        }
+        let _ = sink.close().await;
+    });
     let Some(server_secret) = profile.server_secret else {
         println!("[daemon-rs] ws rejected: profile has no usable E2EE keypair");
-        let _ = socket
+        let _ = queue_tx
             .send(Message::Close(Some(CloseFrame {
                 code: 4001,
                 reason: "Host key unavailable".into(),
             })))
             .await;
+        drop(queue_tx);
+        let _ = writer.await;
         return;
     };
     let devices = state
@@ -228,7 +273,8 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
         .lock()
         .map(|registry| registry.devices())
         .unwrap_or_default();
-    let mut channel = Channel::new(server_secret, devices);
+    let channel = Arc::new(std::sync::Mutex::new(Channel::new(server_secret, devices)));
+    let outbound = Outbound { channel: channel.clone(), queue: queue_tx.clone() };
     let mut rpc = rpc::Rpc::new(
         profile.runtime_id_current.clone(),
         state.registry.clone(),
@@ -238,13 +284,15 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
     let deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
     println!("[daemon-rs] client websocket connected");
     loop {
-        let next = if channel.is_ready() {
-            socket.next().await
+        let ready = channel.lock().map(|c| c.is_ready()).unwrap_or(false);
+        let next = if ready {
+            stream.next().await
         } else {
-            match tokio::time::timeout_at(deadline, socket.next()).await {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
                 Ok(next) => next,
                 Err(_) => {
-                    let _ = socket
+                    let _ = outbound
+                        .queue
                         .send(Message::Close(Some(CloseFrame {
                             code: 4002,
                             reason: "E2EE handshake timeout".into(),
@@ -255,23 +303,27 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
             }
         };
         let Some(Ok(msg)) = next else { break };
-        let actions = match msg {
-            Message::Text(text) => channel.on_text(&text),
-            Message::Binary(bytes) => channel.on_binary(&bytes),
-            Message::Close(_) => break,
-            _ => continue,
+        let actions = {
+            let Ok(mut channel) = channel.lock() else { break };
+            match msg {
+                Message::Text(text) => channel.on_text(&text),
+                Message::Binary(bytes) => channel.on_binary(&bytes),
+                Message::Close(_) => break,
+                _ => continue,
+            }
         };
         let mut close = false;
         for action in actions {
             match action {
                 Action::SendText(text) => {
-                    if socket.send(Message::Text(text.into())).await.is_err() {
+                    if !outbound.send_text(text).await {
                         close = true;
                         break;
                     }
                 }
                 Action::Close(code, reason) => {
-                    let _ = socket
+                    let _ = outbound
+                        .queue
                         .send(Message::Close(Some(CloseFrame { code, reason: reason.into() })))
                         .await;
                     close = true;
@@ -279,8 +331,9 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
                 }
                 Action::Authenticated(device_id) => {
                     println!("[daemon-rs] device authenticated: {device_id}");
+                    let device_token = channel.lock().ok().and_then(|c| c.device_token().map(str::to_string));
                     if let Ok(mut registry) = state.registry.lock() {
-                        registry.note_auth(&device_id, channel.device_token());
+                        registry.note_auth(&device_id, device_token.as_deref());
                     }
                 }
                 Action::RpcText(text) => {
@@ -289,15 +342,22 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
                         .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_string))
                         .unwrap_or_else(|| "?".to_string());
                     println!("[daemon-rs] rpc: {method}");
-                    let ctx = rpc::Ctx {
-                        device_id: channel.device_id().map(str::to_string),
-                        device_token: channel.device_token().map(str::to_string),
-                        transcript_hash_b64: channel.transcript_hash_b64(),
-                    };
+                    let (device_id, device_token, transcript_hash_b64) = channel
+                        .lock()
+                        .map(|c| {
+                            (
+                                c.device_id().map(str::to_string),
+                                c.device_token().map(str::to_string),
+                                c.transcript_hash_b64(),
+                            )
+                        })
+                        .unwrap_or((None, None, None));
+                    let ctx = rpc::Ctx { device_id, device_token, transcript_hash_b64 };
                     if let Some(response) = rpc.handle(&text, &ctx) {
-                        match channel.seal_text(&response) {
+                        let sealed = channel.lock().ok().and_then(|mut c| c.seal_text(&response));
+                        match sealed {
                             Some(sealed) => {
-                                if socket.send(Message::Text(sealed.into())).await.is_err() {
+                                if !outbound.send_text(sealed).await {
                                     close = true;
                                     break;
                                 }
@@ -318,6 +378,9 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
             break;
         }
     }
+    drop(outbound);
+    drop(queue_tx);
+    let _ = writer.await;
     println!("[daemon-rs] client websocket closed");
 }
 
