@@ -1,0 +1,106 @@
+name: orca-rust-desktop-release
+
+# RUST LINE — Fase 4 desktop app. Builds Orca Rust Desktop:
+# the upstream DESKTOP renderer (build:electron-vite output)
+# bundled into the Tauri shell whose window.api shim talks to
+# the in-process Rust runtime — no server, no pairing for its
+# own machine.
+# - Push a desktop-v* tag -> versioned "Orca Rust Desktop" release
+# - Manual run             -> rolling "desktop-dev" prerelease
+
+on:
+  push:
+    tags: ['desktop-v*']
+  workflow_dispatch:
+
+concurrency:
+  group: orca-rust-desktop-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.m.outputs.tag }}
+      prerelease: ${{ steps.m.outputs.prerelease }}
+      name: ${{ steps.m.outputs.name }}
+    steps:
+      - id: m
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/desktop-v* ]]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "name=Orca Rust Desktop ${GITHUB_REF_NAME#desktop-}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=desktop-dev" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "name=Orca Rust Desktop (dev, rolling)" >> "$GITHUB_OUTPUT"
+          fi
+
+  app:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: nsis,msi
+            artifact_glob: |
+              app-desktop/src-tauri/target/release/bundle/nsis/*.exe
+              app-desktop/src-tauri/target/release/bundle/msi/*.msi
+          - os: ubuntu-22.04
+            bundles: appimage,deb
+            artifact_glob: |
+              app-desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+              app-desktop/src-tauri/target/release/bundle/deb/*.deb
+          - os: macos-latest
+            bundles: dmg
+            artifact_glob: |
+              app-desktop/src-tauri/target/release/bundle/dmg/*.dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app-desktop/src-tauri
+      - name: Linux webview dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2
+      - name: Build the desktop renderer
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build:electron-vite
+      - name: Assemble the bundled renderer
+        shell: bash
+        run: |
+          rm -rf app-desktop/resources/renderer
+          cp -r out/renderer app-desktop/resources/renderer
+          du -sh app-desktop/resources/renderer
+      - name: Install the Tauri CLI
+        working-directory: app-desktop
+        run: npm install
+      - name: Generate icons from the upstream Orca icon
+        working-directory: app-desktop
+        run: npx tauri icon ../resources/build/icon.png
+      - name: Build bundles
+        working-directory: app-desktop
+        run: npx tauri build --bundles ${{ matrix.bundles }}
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.name }}
+          prerelease: ${{ needs.meta.outputs.prerelease }}
+          files: ${{ matrix.artifact_glob }}
