@@ -28,12 +28,41 @@ fn log_call(path: &str, args: &[serde_json::Value]) {
             // Args are logged (truncated, single line) because the
             // renderer reports its own crashes through
             // crashReports.recordRendererError — the message only
-            // exists in the args.
+            // exists in the args. Crash-report calls keep a much
+            // larger slice: their errorStack field carries the
+            // full JS stack, which the 600-char cut amputated.
+            let limit = if path.starts_with("crashReports.") {
+                4000
+            } else {
+                600
+            };
             let summary = serde_json::to_string(args)
                 .unwrap_or_default()
                 .replace(['\n', '\r', '\t'], " ");
-            let summary: String = summary.chars().take(600).collect();
+            let summary: String = summary.chars().take(limit).collect();
             let _ = writeln!(file, "{path}\t{}\t{summary}", args.len());
+            let _ = file.flush();
+        }
+    }
+}
+
+/// Logs the value a bridge call answered with (truncated,
+/// single line), prefixed "->". The 0.4.2 boot died rendering
+/// the worktree sidebar on data the bridge itself had served;
+/// without the answers in the log, the poisoned value is
+/// invisible. Diagnostic spam (startup breadcrumbs, crash
+/// reports) is skipped — their inputs are already logged.
+fn log_answer(path: &str, value: &serde_json::Value) {
+    if path.starts_with("app.startupDiagnostic") || path.starts_with("crashReports.") {
+        return;
+    }
+    if let Ok(mut slot) = CALL_LOG.lock() {
+        if let Some(file) = slot.as_mut() {
+            let summary = serde_json::to_string(value)
+                .unwrap_or_default()
+                .replace(['\n', '\r', '\t'], " ");
+            let summary: String = summary.chars().take(800).collect();
+            let _ = writeln!(file, "-> {path}\t{summary}");
             let _ = file.flush();
         }
     }
@@ -71,7 +100,7 @@ fn ipc_invoke(
     args: Vec<serde_json::Value>,
 ) -> serde_json::Value {
     log_call(&path, &args);
-    match path.as_str() {
+    let result = match path.as_str() {
         "settings.get" => state.settings.clone(),
         "repos.list" => domain_or(&state, "repos", empty_list()),
         "repos.isGitAvailable" => serde_json::json!(
@@ -241,7 +270,9 @@ fn ipc_invoke(
         | "plugins.takeRequiredPluginFailures" => empty_list(),
 
         _ => serde_json::Value::Null,
-    }
+    };
+    log_answer(&path, &result);
+    result
 }
 
 /// Builds the shim script with the sync boot values baked
@@ -304,11 +335,20 @@ fn main() {
         .setup(move |app| {
             if let Ok(dir) = app.path().app_data_dir() {
                 let _ = std::fs::create_dir_all(&dir);
-                if let Ok(file) = std::fs::OpenOptions::new()
+                if let Ok(mut file) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(dir.join("shim-calls.log"))
                 {
+                    // Run separator: the log appends across
+                    // runs and versions, so each launch marks
+                    // where its calls begin.
+                    let _ = writeln!(
+                        file,
+                        "=== orca-rust-desktop {} start ===",
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    let _ = file.flush();
                     *CALL_LOG.lock().unwrap() = Some(file);
                 }
             }
