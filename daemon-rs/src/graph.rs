@@ -25,6 +25,9 @@ struct TerminalTab {
     /// PTY session id (the multiplex subscribe handle).
     terminal: String,
     cwd: Option<String>,
+    /// TuiAgent id when this tab hosts an agent session (M5);
+    /// published as `launchAgent` like upstream's terminal tabs.
+    launch_agent: Option<String>,
 }
 
 struct WorktreeGraph {
@@ -65,6 +68,9 @@ impl WorktreeGraph {
                 if let Some(cwd) = &tab.cwd {
                     value["startupCwd"] = json!(cwd);
                 }
+                if let Some(agent) = &tab.launch_agent {
+                    value["launchAgent"] = json!(agent);
+                }
                 value
             })
             .collect();
@@ -102,6 +108,9 @@ fn empty_snapshot(worktree: &str) -> Value {
 #[derive(Default)]
 pub struct Graph {
     worktrees: HashMap<String, WorktreeGraph>,
+    /// createAgentSession idempotency: clientOperationId ->
+    /// terminal handle (upstream replays the original create).
+    agent_ops: HashMap<String, String>,
 }
 
 impl Graph {
@@ -118,6 +127,30 @@ impl Graph {
         terminal: String,
         cwd: Option<String>,
     ) -> (String, Value) {
+        self.add_terminal_inner(worktree, title, terminal, cwd, None)
+    }
+
+    /// add_terminal for an agent session tab (M5): the tab
+    /// carries `launchAgent` in its snapshot.
+    pub fn add_agent_terminal(
+        &mut self,
+        worktree: &str,
+        title: String,
+        terminal: String,
+        cwd: Option<String>,
+        agent: String,
+    ) -> (String, Value) {
+        self.add_terminal_inner(worktree, title, terminal, cwd, Some(agent))
+    }
+
+    fn add_terminal_inner(
+        &mut self,
+        worktree: &str,
+        title: String,
+        terminal: String,
+        cwd: Option<String>,
+        launch_agent: Option<String>,
+    ) -> (String, Value) {
         let graph = self.worktrees.entry(worktree.to_string()).or_insert_with(WorktreeGraph::new);
         let tab = TerminalTab {
             id: crate::registry::uuid(),
@@ -125,6 +158,7 @@ impl Graph {
             title,
             terminal,
             cwd,
+            launch_agent,
         };
         let tab_id = tab.id.clone();
         graph.tabs.push(tab);
@@ -132,6 +166,16 @@ impl Graph {
         graph.version += 1;
         let snapshot = graph.snapshot(worktree);
         (tab_id, snapshot)
+    }
+
+    /// The terminal handle a createAgentSession operation
+    /// already produced, if it was seen before.
+    pub fn agent_op_terminal(&self, operation_id: &str) -> Option<String> {
+        self.agent_ops.get(operation_id).cloned()
+    }
+
+    pub fn record_agent_op(&mut self, operation_id: String, terminal: String) {
+        self.agent_ops.insert(operation_id, terminal);
     }
 
     /// Removes a tab. Returns the PTY handle to retire and the

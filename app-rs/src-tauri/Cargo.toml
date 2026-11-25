@@ -1,6 +1,6 @@
 [package]
 name = "orca-rust-app"
-version = "0.2.0"
+version = "0.3.1"
 description = "Orca Rust - full-Rust Orca desktop: the orca-daemon-rs daemon linked in-process, no Node"
 edition = "2021"
 

@@ -12,6 +12,7 @@
 //! binary (headless server) and the Rust desktop app (app-rs),
 //! which links it in-process — one binary, one runtime, no Node.
 
+mod agents;
 mod channel;
 mod e2ee;
 mod graph;
@@ -153,7 +154,7 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
     let paired = state.registry.lock().map(|r| r.count()).unwrap_or(0);
     axum::Json(serde_json::json!({
         "daemon": "orca-daemon-rs",
-        "milestone": "M3",
+        "milestone": "M5",
         "profileDir": profile.dir.display().to_string(),
         "installationId": profile.installation_id,
         "hostPublicKeyB64": profile.public_key_b64,

@@ -109,6 +109,8 @@ impl Rpc {
             "pairing.exchangeTicket" => self.exchange_ticket(&params, ctx),
             "pairing.registerDeviceKey" => self.register_device_key(&params, ctx),
             "terminal.create" => self.terminal_create(&params),
+            "terminal.createAgentSession" => self.agent_session_create(&params),
+            "terminal.ensureAgentSession" => self.agent_session_ensure(&params),
             "terminal.multiplex" => Ok(json!({ "type": "ready" })),
             "terminal.send" => self.terminal_send(&params),
             "terminal.read" => self.terminal_read(&params),
@@ -251,8 +253,123 @@ impl Rpc {
         Ok(snapshot)
     }
 
-    fn tabs_close(&self, params: &Value) -> Result<Value, String> {
+    // --- Agent sessions (M5 slice 1: the TUI path) ---------
+    // terminal.createAgentSession / ensureAgentSession spawn
+    // the agent CLI as a TUI in a PTY and publish a terminal
+    // tab carrying launchAgent. Prompts are typed into the
+    // TUI after a short startup delay (upstream types them
+    // too); 'draft' delivery omits the trailing Enter.
+
+    fn agent_session_create(&self, params: &Value) -> Result<Value, String> {
+        let agent = params.get("agent").and_then(|v| v.as_str()).unwrap_or("");
+        if crate::agents::agent_executable(agent).is_none() {
+            return Err("unknown_agent".to_string());
+        }
+        let operation_id = params
+            .get("clientOperationId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "invalid_argument".to_string())?;
+        if let Ok(graph) = self.graph.lock() {
+            if let Some(handle) = graph.agent_op_terminal(operation_id) {
+                let pty = self.pty.lock().map_err(|_| "pty_unavailable")?;
+                return Ok(json!({
+                    "terminal": terminal_json(&handle, &pty),
+                    "disposition": "replayed",
+                }));
+            }
+        }
         let Some(key) = self.worktree_key(params) else {
+            return Err("invalid_argument".to_string());
+        };
+        let command = crate::agents::launch_command(
+            agent,
+            params.get("agentArgs").and_then(|v| v.as_str()),
+            params.get("extraAgentArgs").and_then(|v| v.as_str()),
+        )
+        .ok_or_else(|| "unknown_agent".to_string())?;
+        let mut spawn_params = json!({
+            "worktree": params.get("worktree").cloned().unwrap_or(Value::Null),
+            "command": command,
+            "title": agent,
+        });
+        if let Some(cwd) = params.get("startupCwd").and_then(|v| v.as_str()) {
+            spawn_params["cwd"] = json!(cwd);
+        }
+        let handle = self.spawn_terminal(&spawn_params)?;
+        let cwd = params
+            .get("startupCwd")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| self.resolve_worktree_path(params.get("worktree").and_then(|v| v.as_str())));
+        {
+            let mut graph = self.graph.lock().map_err(|_| "graph_unavailable")?;
+            graph.add_agent_terminal(&key, agent.to_string(), handle.clone(), cwd, agent.to_string());
+            graph.record_agent_op(operation_id.to_string(), handle.clone());
+        }
+        if let Some(prompt) = params.get("prompt").and_then(|v| v.as_str()) {
+            if !prompt.is_empty() {
+                let submit = params.get("promptDelivery").and_then(|v| v.as_str()) != Some("draft");
+                self.type_prompt_later(handle.clone(), prompt.to_string(), submit);
+            }
+        }
+        let pty = self.pty.lock().map_err(|_| "pty_unavailable")?;
+        Ok(json!({
+            "terminal": terminal_json(&handle, &pty),
+            "disposition": "created",
+        }))
+    }
+
+    fn agent_session_ensure(&self, params: &Value) -> Result<Value, String> {
+        if params.get("kind").and_then(|v| v.as_str()) != Some("explicit") {
+            // 'automatic' resumes from sleeping checkpoints,
+            // which the subset does not keep.
+            return Err("unsupported_ensure_kind".to_string());
+        }
+        let agent = params.get("agent").and_then(|v| v.as_str()).unwrap_or("");
+        let session = params.get("providerSession").ok_or_else(|| "invalid_argument".to_string())?;
+        let key = session.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        let id = session.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let transcript = session.get("transcriptPath").and_then(|v| v.as_str());
+        let command = crate::agents::resume_command(agent, key, id, transcript)
+            .ok_or_else(|| "session_not_resumable".to_string())?;
+        let Some(graph_key) = self.worktree_key(params) else {
+            return Err("invalid_argument".to_string());
+        };
+        let spawn_params = json!({
+            "worktree": params.get("worktree").cloned().unwrap_or(Value::Null),
+            "command": command,
+            "title": agent,
+        });
+        let handle = self.spawn_terminal(&spawn_params)?;
+        let cwd = self.resolve_worktree_path(params.get("worktree").and_then(|v| v.as_str()));
+        {
+            let mut graph = self.graph.lock().map_err(|_| "graph_unavailable")?;
+            graph.add_agent_terminal(&graph_key, agent.to_string(), handle.clone(), cwd, agent.to_string());
+        }
+        let pty = self.pty.lock().map_err(|_| "pty_unavailable")?;
+        Ok(json!({
+            "terminal": terminal_json(&handle, &pty),
+            "disposition": "created",
+        }))
+    }
+
+    /// Types the launch prompt into the agent TUI once it has
+    /// had a moment to start (upstream waits for TUI readiness;
+    /// the subset uses a fixed delay).
+    fn type_prompt_later(&self, handle: String, prompt: String, submit: bool) {
+        let pty = self.pty.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            if let Ok(mut manager) = pty.lock() {
+                let _ = manager.write(&handle, prompt.as_bytes());
+                if submit {
+                    let _ = manager.write(&handle, b"\r");
+                }
+            }
+        });
+    }
+
+    fn tabs_close(&self, params: &Value) -> Result<Value, String> {        let Some(key) = self.worktree_key(params) else {
             return Err("invalid_argument".to_string());
         };
         let tab_id = params

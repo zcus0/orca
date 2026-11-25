@@ -519,3 +519,56 @@ daemon-rs work for slice 3, in order:
   M4's remaining acceptance is the real web client run
   against the zcus6 test deploy (daemon-rs there still runs
   the M3 build — redeploy before browser testing).
+
+## M5 scoping (2026-11-25, from fork source)
+
+Two distinct agent surfaces exist upstream:
+
+1. **TUI agent sessions** — `terminal.createAgentSession` /
+   `terminal.ensureAgentSession`
+   (src/main/runtime/rpc/methods/terminal/agent-session.ts;
+   params in src/shared/rpc-contract/terminal/agent-session-params.ts).
+   The agent CLI (TuiAgent catalog, ~37 ids in
+   src/shared/agent-launch/catalog/tui-agent.ts) runs as a TUI
+   inside a PTY; in the session graph it is a TERMINAL tab with
+   `launchAgent` set (RuntimeMobileSessionTerminalTab). Create
+   result: {terminal: RuntimeTerminalCreate, disposition:
+   'created' | 'replayed'} with idempotency keyed on
+   clientOperationId. Prompt delivery is typed into the TUI
+   ('auto-submit' appends Enter; 'draft' does not). Resume
+   (ensure, kind 'explicit') uses per-agent argv from
+   agent-resume-argv.ts: claude --resume <id>, codex resume
+   <id>, opencode --session <id>, pi --session <transcript>,
+   omp ... --resume <target>.
+2. **Structured chat sessions** — the `agentSession.*` namespace
+   (create/cancel/approve/commands/conversation/...): a hosted
+   provider-protocol layer, much larger. OUT of M5's first
+   slices; the TUI path is what Orca's panes use for CLI agents.
+
+daemon-rs M5 slice 1 = the TUI path: agent catalog (id →
+executable) for the common agents, createAgentSession on the
+shared PTY spawn + graph publish (tab carries launchAgent),
+typed prompt delivery, ensureAgentSession explicit resume for
+claude/codex/opencode/pi/omp. Deliberate subset limits: no
+launch accounts/env routing, no spawn-intent deferral, no
+agent status inference (tabs carry no agentStatus), automatic
+ensure (sleeping checkpoints) refused.
+- 2026-11-25: M5 slice 1 done — the TUI agent path
+  (src/agents.rs + rpc/graph wiring). Catalog maps the common
+  TuiAgent ids to their CLI executables (~24 agents).
+  `terminal.createAgentSession` validates the agent, honors
+  clientOperationId idempotency (same op id → the original
+  terminal with disposition 'replayed'), spawns via the shared
+  PTY path with agentArgs/extraAgentArgs appended raw,
+  publishes a graph tab carrying `launchAgent`, and types the
+  prompt into the TUI after 1.2 s (Enter appended unless
+  promptDelivery 'draft'). `terminal.ensureAgentSession`
+  implements kind 'explicit' resume for claude/codex/opencode/
+  opencode2/pi/omp with upstream's argv; kind 'automatic' is
+  refused (no sleeping-checkpoint store). Versions bumped to
+  0.3.1 (daemon crate, app crate, tauri.conf) so release asset
+  names match the tag. Verified: 25/25 cargo tests + live E2E
+  (create → replay → graph launchAgent → ensure resume →
+  unknown agent refused; M5_E2E_OK). Still open in M5: the
+  structured `agentSession.*` chat host, agent status
+  inference, launch accounts/env.
