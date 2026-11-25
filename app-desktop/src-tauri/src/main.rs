@@ -585,7 +585,7 @@ fn ipc_invoke(
             "disabledReason": "orca_telemetry_disabled",
         }),
         "telemetryGetConsentState" => {
-            if telemetry_opt_in(state) {
+            if telemetry_opt_in(&state) {
                 serde_json::json!({ "effective": "enabled" })
             } else {
                 serde_json::json!({
@@ -599,7 +599,7 @@ fn ipc_invoke(
                 .first()
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            set_telemetry_opt_in(state, opted_in);
+            set_telemetry_opt_in(&state, opted_in);
             serde_json::Value::Null
         }
         "cache.getGitHub" => domain_or(
