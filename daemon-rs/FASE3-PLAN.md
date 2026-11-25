@@ -413,3 +413,42 @@ M4 slices:
 3. Streaming: terminal.subscribe + the multiplex binary protocol
    (snapshot on attach, sequenced live frames, ack/flow control,
    resume) — the bit-compat-heavy part.
+
+## M4 slice 3 scoping (2026-11-25, from fork source)
+
+Terminal output reaches the web client ONLY through the binary
+multiplex protocol — there is no text-frame event channel for
+terminal streams. Server-side `terminal.subscribe`
+(terminal-subscribe-method.ts) is a streaming method whose emit()
+events are encoded as binary frames
+(`encodeTerminalStreamJson({kind: ...})`, fixtures in
+src/renderer/src/components/terminal-pane/pty-transport/remote/
+remote-runtime-pty-transport-stream-fixtures.ts) and routed by
+runtime-binary-message-router.ts. The 'JSON subscription'
+(terminal-subscribe-json-and-lease.ts) is JSON _payloads inside
+those binary frames_, not WS text frames. Mobile clients REQUIRE
+the binary stream (`binary_terminal_stream_required`).
+
+Event kinds on a subscription: `subscribed` {streamId, lines,
+truncated} (lease path), then for data subscriptions a
+`scrollback` {lines (read tail), truncated, serialized, oscLinks,
+cwd, cols, rows, displayMode, seq}, then `data` {chunk} batches,
+and `fit-override-changed` {mode, cols, rows}. Params:
+TerminalSubscribe = handle + optional client {id, type},
+viewport, capabilities {terminalBinaryStream: 1, outputAck: 1,
+...}, resume {streamToken, units}.
+
+daemon-rs work for slice 3, in order:
+
+1. WS loop refactor: split sink/stream + an outbound queue so the
+   daemon can push sealed frames outside request/response
+   (channel.rs Action::RpcBinary stops being a dead end).
+2. Multiplex frame codec per the fixtures + stream-schemas.ts
+   (frame header, stream ids, snapshot/data/ack kinds).
+3. terminal.subscribe/unsubscribe over the PTY core: scrollback
+   from the ring buffer (raw bytes split to lines — daemon-rs has
+   no terminal emulator, so `serialized` stays absent), data
+   events from the pump, ack/flow-control window.
+4. Session graph bridge: terminals created via terminal.create
+   must appear in session.tabs snapshots for the web client to
+   render panes at all (overlaps M3's remaining graph work).
