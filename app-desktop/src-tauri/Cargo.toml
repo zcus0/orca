@@ -1,0 +1,18 @@
+[package]
+name = "orca-rust-desktop-app"
+version = "0.4.0"
+description = "Orca Rust Desktop (Fase 4) - the upstream desktop renderer running on the Rust runtime in-process, no server"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+orca-daemon-rs = { path = "../../daemon-rs" }
+
+[profile.release]
+lto = true
+codegen-units = 1
