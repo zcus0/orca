@@ -83,9 +83,12 @@ fn log_answer(path: &str, value: &serde_json::Value) {
 /// platform string ("win32" / "darwin" / "linux").
 struct BridgeState {
     profile_dir: PathBuf,
-    settings: serde_json::Value,
+    settings: Mutex<serde_json::Value>,
+    stored_settings: Mutex<serde_json::Value>,
     runtime_id: String,
     platform: String,
+    rpc: Mutex<orca_daemon_rs::rpc::Rpc>,
+    rpc_seq: Mutex<u64>,
 }
 
 fn domain_or(state: &BridgeState, domain: &str, fallback: serde_json::Value) -> serde_json::Value {
@@ -104,11 +107,50 @@ fn now_millis() -> u64 {
 }
 
 fn git_available() -> bool {
-    std::process::Command::new("git")
-        .arg("--version")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("--version");
+        // CREATE_NO_WINDOW: this probe runs on renderer focus /
+        // workspace refresh calls, and a console window flashing
+        // into alt-tab on every probe reads as the app spawning
+        // processes. Probe once, invisibly, and cache it.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        cmd.output().map(|out| out.status.success()).unwrap_or(false)
+    })
+}
+
+/// Forwards one runtime.call to the in-process daemon-rs RPC
+/// dispatch and unwraps its response envelope. None when the
+/// daemon does not implement the method (or errors), so the
+/// caller can fall back to the desktop-shaped stubs.
+fn dispatch_runtime(
+    state: &BridgeState,
+    method: &str,
+    params: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let id = {
+        let mut seq = state.rpc_seq.lock().ok()?;
+        *seq += 1;
+        format!("desktop-{}", *seq)
+    };
+    let request = serde_json::json!({ "id": id, "method": method, "params": params }).to_string();
+    let ctx = orca_daemon_rs::rpc::Ctx {
+        device_id: None,
+        device_token: None,
+        transcript_hash_b64: None,
+    };
+    let response = state.rpc.lock().ok()?.handle(&request, &ctx)?;
+    let parsed: serde_json::Value = serde_json::from_str(&response).ok()?;
+    if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        parsed.get("result").cloned()
+    } else {
+        None
+    }
 }
 
 /// The one bridge command: every window.api call arrives
@@ -135,7 +177,99 @@ fn ipc_invoke(
         SESSION_ACTIVE.store(active, Ordering::Relaxed);
     }
     let result = match path.as_str() {
-        "settings.get" => state.settings.clone(),
+        "settings.get" => state
+            .settings
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|_| serde_json::json!({})),
+        // Settings writes used to be discarded, so every choice
+        // reset on restart. Now: merge the patch into the stored
+        // settings document, persist it in upstream's format,
+        // and serve the re-merged effective snapshot.
+        "settings.set" => {
+            if let Some(patch) = args.first().filter(|p| p.is_object()) {
+                let merged_stored = {
+                    let mut stored = state
+                        .stored_settings
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let merged = merge_json(&stored, patch);
+                    *stored = merged.clone();
+                    merged
+                };
+                orca_daemon_rs::profile_state::write_domain(
+                    &state.profile_dir,
+                    "settings",
+                    &merged_stored,
+                );
+                let effective = effective_from_stored(Some(&merged_stored));
+                if let Ok(mut settings) = state.settings.lock() {
+                    *settings = effective;
+                }
+            }
+            serde_json::Value::Null
+        }
+        "onboarding.update" => {
+            if let Some(value) = args.first() {
+                orca_daemon_rs::profile_state::write_domain(
+                    &state.profile_dir,
+                    "onboarding",
+                    value,
+                );
+            }
+            serde_json::Value::Null
+        }
+        "session.patchEntries" => {
+            if let Some(patch) = args.first() {
+                let mut session = domain_or(
+                    &state,
+                    "workspaceSession",
+                    serde_json::json!({
+                        "activeRepoId": null,
+                        "activeWorktreeId": null,
+                        "activeTabId": null,
+                        "tabsByWorktree": {},
+                        "terminalLayoutsByTabId": {},
+                    }),
+                );
+                if let (Some(obj), Some(fields)) = (
+                    session.as_object_mut(),
+                    patch.get("fields").and_then(|f| f.as_object()),
+                ) {
+                    for (k, v) in fields {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                    if let Some(entries) = patch.get("entries").and_then(|e| e.as_object()) {
+                        if !entries.is_empty() {
+                            let slot = obj
+                                .entry("entries".to_string())
+                                .or_insert_with(|| serde_json::json!({}));
+                            if let Some(slot_obj) = slot.as_object_mut() {
+                                for (k, v) in entries {
+                                    slot_obj.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                orca_daemon_rs::profile_state::write_domain(
+                    &state.profile_dir,
+                    "workspaceSession",
+                    &session,
+                );
+            }
+            serde_json::Value::Null
+        }
+        "cache.setGitHub" => {
+            if let Some(cache) = args.first().and_then(|a| a.get("cache")) {
+                orca_daemon_rs::profile_state::write_domain(
+                    &state.profile_dir,
+                    "githubCache",
+                    cache,
+                );
+            }
+            serde_json::Value::Null
+        }
         "repos.list" => domain_or(&state, "repos", empty_list()),
         "repos.isGitAvailable" => serde_json::json!(git_available()),
         "app.quit" => {
@@ -185,13 +319,17 @@ fn ipc_invoke(
         | "wslMove.listPendingRendererRewrites"
         | "wslDriveUnc.listPendingRendererRewrites" => empty_list(),
         "session.desktopRelaysVersion" => serde_json::json!(0),
-        "onboarding.get" => serde_json::json!({
-            "flowVersion": 1,
-            "closedAt": null,
-            "outcome": null,
-            "lastCompletedStep": -1,
-            "checklist": {},
-        }),
+        "onboarding.get" => domain_or(
+            &state,
+            "onboarding",
+            serde_json::json!({
+                "flowVersion": 1,
+                "closedAt": null,
+                "outcome": null,
+                "lastCompletedStep": -1,
+                "checklist": {},
+            }),
+        ),
         "keybindings.get" => serde_json::json!({
             "path": "",
             "platform": state.platform,
@@ -304,12 +442,17 @@ fn ipc_invoke(
             "workspaceLineage": {},
             "crossStoreLineage": {},
         }),
-        "cache.getGitHub" => serde_json::json!({ "pr": {}, "issue": {} }),
+        "cache.getGitHub" => domain_or(
+            &state,
+            "githubCache",
+            serde_json::json!({ "pr": {}, "issue": {} }),
+        ),
         // runtime.call routes RPC methods to the local
-        // runtime; the boot path asks for the bots catalog,
-        // whose result shapes are {bots:[...]} / {groups:[]}
-        // (component-fixtures/fixture-bots.ts). Other methods
-        // get an empty object rather than null for now.
+        // runtime. Desktop-catalog methods the daemon does not
+        // implement keep their shaped stubs; everything else is
+        // forwarded to the in-process daemon-rs dispatch
+        // (status, repos, session graph, terminals, agent
+        // sessions, pairing) — a real local runtime, no server.
         "runtime.call" => {
             let method = args
                 .first()
@@ -319,7 +462,15 @@ fn ipc_invoke(
             match method {
                 "bots.list" => serde_json::json!({ "bots": [] }),
                 "bots.groups.list" => serde_json::json!({ "groups": [] }),
-                _ => serde_json::json!({}),
+                _ => {
+                    let params = args
+                        .first()
+                        .and_then(|a| a.get("params"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    dispatch_runtime(&state, method, params)
+                        .unwrap_or_else(|| serde_json::json!({}))
+                }
             }
         }
         "linear.status" => serde_json::json!({
@@ -413,19 +564,18 @@ fn merge_json(base: &serde_json::Value, over: &serde_json::Value) -> serde_json:
     }
 }
 
-/// The settings snapshot the bridge serves: stored profile
-/// settings deep-merged over the upstream defaults. When the
-/// profile never chose a workspace dir, point it at the real
-/// home directory's orca/workspaces like getDefaultSettings
-/// does, instead of the path baked into the generated JSON.
-fn effective_settings(profile_dir: &std::path::Path) -> serde_json::Value {
-    let stored = orca_daemon_rs::profile_state::read_domain(profile_dir, "settings");
+/// The effective settings served to the renderer: the stored
+/// settings document deep-merged over the upstream defaults.
+/// When the profile never chose a workspace dir, point it at
+/// the real home directory's orca/workspaces like
+/// getDefaultSettings does, instead of the path baked into
+/// the generated JSON.
+fn effective_from_stored(stored: Option<&serde_json::Value>) -> serde_json::Value {
     let stored_has_workspace = stored
-        .as_ref()
         .and_then(|s| s.get("workspaceDir"))
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty());
-    let mut merged = match &stored {
+    let mut merged = match stored {
         Some(s) => merge_json(&default_settings(), s),
         None => default_settings(),
     };
@@ -563,7 +713,10 @@ fn check_for_update(app: tauri::AppHandle) {
 
 fn main() {
     let profile_dir = orca_daemon_rs::resolve_profile_dir();
-    let settings = effective_settings(&profile_dir);
+    let stored_settings =
+        orca_daemon_rs::profile_state::read_domain(&profile_dir, "settings")
+            .unwrap_or_else(|| serde_json::json!({}));
+    let settings = effective_from_stored(Some(&stored_settings));
     let shim = shim_script(&settings);
     let platform = match std::env::consts::OS {
         "windows" => "win32",
@@ -579,6 +732,25 @@ fn main() {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("desktop-{:x}-{}", nanos, std::process::id())
+    };
+    // The in-process local runtime: daemon-rs's RPC dispatch
+    // over the same RS profile, with its own PTY manager and
+    // session graph. No port, no server — runtime.call invokes
+    // it directly.
+    let rpc = {
+        use std::sync::Arc;
+        let registry = Arc::new(Mutex::new(orca_daemon_rs::registry::Registry::load(
+            profile_dir.clone(),
+        )));
+        let pty = Arc::new(Mutex::new(orca_daemon_rs::pty::PtyManager::new()));
+        let graph = Arc::new(Mutex::new(orca_daemon_rs::graph::Graph::new()));
+        orca_daemon_rs::rpc::Rpc::new(
+            runtime_id.clone(),
+            registry,
+            profile_dir.clone(),
+            pty,
+            graph,
+        )
     };
     tauri::Builder::default()
         // Single instance: a second launch (or the installer
@@ -615,9 +787,12 @@ fn main() {
         })
         .manage(BridgeState {
             profile_dir,
-            settings,
+            settings: Mutex::new(settings),
+            stored_settings: Mutex::new(stored_settings),
             runtime_id,
             platform,
+            rpc: Mutex::new(rpc),
+            rpc_seq: Mutex::new(0),
         })
         .invoke_handler(tauri::generate_handler![ipc_invoke])
         .setup(move |app| {

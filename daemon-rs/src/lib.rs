@@ -15,12 +15,12 @@
 mod agents;
 mod channel;
 mod e2ee;
-mod graph;
+pub mod graph;
 mod multiplex;
 pub mod profile_state;
-mod pty;
-mod registry;
-mod rpc;
+pub mod pty;
+pub mod registry;
+pub mod rpc;
 mod stream;
 
 use std::path::PathBuf;
