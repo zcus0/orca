@@ -37,17 +37,27 @@ const DEBUG_REPORT_URL: &str = "https://orca-debug.zcus.dev/report";
 /// read it directly — no more manual log pastes. Fire and
 /// forget on a spawned thread; every failure is silent.
 fn upload_crash_report(crash_args: &[serde_json::Value]) {
-    let log_tail = LOG_PATH
-        .lock()
-        .ok()
-        .and_then(|slot| slot.clone())
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .map(|text| {
-            let lines: Vec<&str> = text.lines().collect();
-            let start = lines.len().saturating_sub(900);
-            lines[start..].join("\n")
-        })
-        .unwrap_or_default();
+    // Early-boot uploads raced the log setup on 0.6.4 and
+    // arrived with an empty tail; if the first read comes
+    // back empty, wait briefly and read once more.
+    let read_tail = || {
+        LOG_PATH
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|text| {
+                let lines: Vec<&str> = text.lines().collect();
+                let start = lines.len().saturating_sub(900);
+                lines[start..].join("\n")
+            })
+            .unwrap_or_default()
+    };
+    let mut log_tail = read_tail();
+    if log_tail.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        log_tail = read_tail();
+    }
     let payload = serde_json::json!({
         "app": "orca-rust-desktop",
         "version": env!("CARGO_PKG_VERSION"),
@@ -822,6 +832,25 @@ fn ipc_invoke(
             "apiKeyConfigured": false,
         }),
         "agentStatus.getSnapshot" => empty_list(),
+        // MigrationUnsupportedPtyEntry[] — the startup
+        // snapshot loader iterates the result; null threw
+        // "e is not iterable" as an unhandled rejection on
+        // 0.6.4 (caught by the new shim error hook).
+        "agentStatus.getMigrationUnsupportedSnapshot" => empty_list(),
+        // NotificationPermissionStatusResult — the
+        // onboarding yolo-permissions hook reads .platform
+        // off the result; null rejected on 0.6.4. supported
+        // false makes every consumer a clean no-op.
+        "notifications.getPermissionStatus" => serde_json::json!({
+            "supported": false,
+            "platform": state.platform,
+            "requested": false,
+        }),
+        // NotificationDeliveryProbeResult.
+        "notifications.probeDelivery" => serde_json::json!({
+            "state": "unsupported",
+            "authoritative": false,
+        }),
         "dashboard.getPopoutOpen" => serde_json::json!(false),
         "ui.consumePendingMarkdownFileOpens" => empty_list(),
         // Read-only statuses from the settings sweep:
