@@ -613,7 +613,10 @@ fn ipc_invoke(
             "ok": false,
             "error": "GitLab is not configured",
         }),
-        "pty.management.listSessions" => empty_list(),
+        "pty.management.listSessions" => serde_json::json!({
+            "sessions": [],
+            "degraded": false,
+        }),
         // --- Settings sweep (0.5.3, from the first real
         // crash uploads): the Plugins section crashed on
         // .filter() because listMarketplacePlugins was null;
@@ -663,6 +666,51 @@ fn ipc_invoke(
             "activeAccountId": null,
             "activeAccountIdsByRuntime": { "host": null, "wsl": {} },
         }),
+        // Signed-out account statuses (rate-limit-types):
+        // these answered null and the accounts page reads
+        // fields off them directly.
+        "grokAccounts.getStatus" => serde_json::json!({
+            "signedIn": false,
+            "email": null,
+            "teamId": null,
+            "tokenFresh": false,
+            "error": null,
+        }),
+        "cursorAccounts.getStatus" => serde_json::json!({
+            "signedIn": false,
+            "email": null,
+            "displayName": null,
+            "credentialSource": null,
+            "planType": null,
+            "tokenFresh": false,
+            "error": null,
+        }),
+        // Credential + sync statuses the accounts page
+        // reads fields off (all answered null before this
+        // pass — shapes from src/shared/agent-accounts).
+        "codexConfigSync.status" => serde_json::json!({
+            "state": "synced",
+            "reason": null,
+            "systemConfigPath": "",
+        }),
+        "minimaxCredentials.getStatus" => serde_json::json!({
+            "configured": false,
+            "cookieConfigured": false,
+            "apiKeyConfigured": false,
+            "cookieProtection": null,
+            "apiKeyProtection": null,
+        }),
+        "zcodePlanCredentials.getStatus" => serde_json::json!({
+            "apiKeyConfigured": false,
+            "zcodeCliConfigured": false,
+            "apiKeyProtection": null,
+        }),
+        "opencodeGoCredentials.getStatus" => serde_json::json!({
+            "apiKeyConfigured": false,
+        }),
+        "agentStatus.getSnapshot" => empty_list(),
+        "dashboard.getPopoutOpen" => serde_json::json!(false),
+        "ui.consumePendingMarkdownFileOpens" => empty_list(),
         "claudeUsage.getScanState" => serde_json::json!({
             "enabled": true,
             "isScanning": false,
@@ -758,6 +806,46 @@ fn ipc_invoke(
                 "bots.share.status" => serde_json::json!({
                     "ok": true,
                     "result": { "status": "ok", "value": [] },
+                }),
+                // Provider accounts (Settings → AI Provider
+                // Accounts), shapes from src/shared/agent-
+                // accounts: the sections read snapshot[provider]
+                // and render a thrown RPC error's message
+                // verbatim — an unimplemented method used to
+                // surface as "Cannot read properties of
+                // undefined (reading 'message')" under every
+                // provider. No managed accounts exist locally.
+                "accounts.listData" => serde_json::json!({
+                    "opencode": { "accounts": [], "activeAccountId": null },
+                    "devin": { "accounts": [], "activeAccountId": null },
+                }),
+                "accounts.addDataFromHome"
+                | "accounts.selectData"
+                | "accounts.removeData" => serde_json::json!({
+                    "accounts": [],
+                    "activeAccountId": null,
+                }),
+                "accounts.antigravityList" => serde_json::json!({
+                    "accounts": [],
+                    "activeAccountId": null,
+                    "currentAccount": null,
+                    "selectedAccountId": null,
+                }),
+                "accounts.list" => serde_json::json!({
+                    "opencode": { "accounts": [], "activeAccountId": null },
+                    "devin": { "accounts": [], "activeAccountId": null },
+                    "claude": { "accounts": [], "activeAccountId": null },
+                    "codex": {
+                        "accounts": [],
+                        "activeAccountId": null,
+                        "activeAccountIdsByRuntime": { "host": null, "wsl": {} },
+                    },
+                    "rateLimits": empty_rate_limit_state(),
+                }),
+                "workspaceCleanup.codexHistoryDiskUsage" => serde_json::json!({
+                    "bytes": 0,
+                    "rollouts": 0,
+                    "complete": true,
                 }),
                 _ => {
                     let params = args
