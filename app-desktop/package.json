@@ -1,1 +1,1 @@
-{"devDependencies":{"@tauri-apps/cli":"2.12.6"},"name":"orca-rust-desktop-app","private":true,"scripts":{"tauri":"tauri"},"version":"0.6.6"}
+{"devDependencies":{"@tauri-apps/cli":"2.12.6"},"name":"orca-rust-desktop-app","private":true,"scripts":{"tauri":"tauri"},"version":"0.6.7"}

@@ -1360,8 +1360,14 @@ fn updater_log(msg: &str) {
 /// Scans the desktop-dev release for the newest Windows
 /// setup exe newer than this build. Returns (version, url).
 fn fetch_newer_release(client: &reqwest::blocking::Client) -> Option<(String, String)> {
-    let release: serde_json::Value = match client
-        .get("https://api.github.com/repos/zcus0/orca/releases/tags/desktop-dev")
+    // Scans the repo's recent releases (the rolling
+    // desktop-dev prerelease AND the versioned desktop-v*
+    // releases) and picks the newest installer anywhere.
+    // Versioned releases matter because they are published
+    // by tag pushes over git — no browser dispatch, which
+    // kept dying on GitHub login expiry.
+    let releases: serde_json::Value = match client
+        .get("https://api.github.com/repos/zcus0/orca/releases?per_page=30")
         .send()
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.json())
@@ -1374,22 +1380,27 @@ fn fetch_newer_release(client: &reqwest::blocking::Client) -> Option<(String, St
     };
     let current = parse_version(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0, 0));
     let mut best: Option<((u32, u32, u32), String, String)> = None;
-    if let Some(assets) = release.get("assets").and_then(|a| a.as_array()) {
-        for asset in assets {
-            let name = asset.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            let Some(vstr) = name
-                .strip_prefix("Orca.Rust.Desktop_")
-                .and_then(|rest| rest.strip_suffix("_x64-setup.exe"))
-            else {
+    if let Some(list) = releases.as_array() {
+        for release in list {
+            let Some(assets) = release.get("assets").and_then(|a| a.as_array()) else {
                 continue;
             };
-            let Some(v) = parse_version(vstr) else { continue };
-            if v > current && best.as_ref().is_none_or(|(bv, _, _)| v > *bv) {
-                if let Some(url) = asset
-                    .get("browser_download_url")
-                    .and_then(|u| u.as_str())
-                {
-                    best = Some((v, vstr.to_string(), url.to_string()));
+            for asset in assets {
+                let name = asset.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let Some(vstr) = name
+                    .strip_prefix("Orca.Rust.Desktop_")
+                    .and_then(|rest| rest.strip_suffix("_x64-setup.exe"))
+                else {
+                    continue;
+                };
+                let Some(v) = parse_version(vstr) else { continue };
+                if v > current && best.as_ref().is_none_or(|(bv, _, _)| v > *bv) {
+                    if let Some(url) = asset
+                        .get("browser_download_url")
+                        .and_then(|u| u.as_str())
+                    {
+                        best = Some((v, vstr.to_string(), url.to_string()));
+                    }
                 }
             }
         }
