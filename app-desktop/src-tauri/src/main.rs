@@ -1519,8 +1519,9 @@ fn main() {
             .build()?;
             // Background update checks: first a few seconds
             // after the window is up so the prompt never
-            // fights first paint, then every 6 hours so a
-            // long-running app still learns about releases.
+            // fights first paint, then every minute (his
+            // standing order) so a running app picks up new
+            // builds almost immediately.
             #[cfg(target_os = "windows")]
             {
                 let handle = app.handle().clone();
@@ -1528,7 +1529,7 @@ fn main() {
                     std::thread::sleep(std::time::Duration::from_secs(5));
                     loop {
                         check_for_update(handle.clone());
-                        std::thread::sleep(std::time::Duration::from_secs(6 * 60 * 60));
+                        std::thread::sleep(std::time::Duration::from_secs(60));
                     }
                 });
             }
