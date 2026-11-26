@@ -103,4 +103,33 @@
     } catch (e) { /* log only */ }
     return originalConsoleError(...parts);
   };
+
+  // The native titlebar is gone (upstream hides it too);
+  // the renderer's titlebar marks itself with
+  // -webkit-app-region: drag, which WebView2 does not
+  // act on. Bridge it to Tauri dragging: press on a drag
+  // region moves the window, double-click toggles
+  // maximize. Interactive elements never drag.
+  document.addEventListener('mousedown', (event) => {
+    if (event.button !== 0) return;
+    const tauriWindow = window.__TAURI__ && window.__TAURI__.window;
+    if (!tauriWindow) return;
+    let el = event.target;
+    if (el && el.closest && el.closest('button, a, input, select, textarea, [role="button"], [contenteditable="true"]')) return;
+    while (el && el !== document.body) {
+      let region = '';
+      try { region = getComputedStyle(el).getPropertyValue('-webkit-app-region').trim(); } catch (e) { /* ignore */ }
+      if (region === 'no-drag') return;
+      if (region === 'drag') {
+        const current = tauriWindow.getCurrentWindow();
+        if (event.detail === 2) {
+          current.toggleMaximize().catch(() => {});
+        } else {
+          current.startDragging().catch(() => {});
+        }
+        return;
+      }
+      el = el.parentElement;
+    }
+  }, true);
 })();

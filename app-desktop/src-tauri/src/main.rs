@@ -24,6 +24,34 @@ use tauri_plugin_dialog::DialogExt;
 
 static CALL_LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
 static LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// In-memory copy of the newest log lines. Two 0.6.4/0.6.5
+/// crash uploads arrived with an empty file tail for a
+/// reason the reports themselves could not show; the ring
+/// guarantees every upload carries the recent log.
+static LOG_RING: Mutex<std::collections::VecDeque<String>> =
+    Mutex::new(std::collections::VecDeque::new());
+static LAST_MAXIMIZED: AtomicBool = AtomicBool::new(false);
+
+fn ring_push(line: &str) {
+    if let Ok(mut ring) = LOG_RING.lock() {
+        if ring.len() >= 500 {
+            ring.pop_front();
+        }
+        ring.push_back(line.to_string());
+    }
+}
+
+fn ring_tail() -> String {
+    LOG_RING
+        .lock()
+        .map(|ring| {
+            ring.iter()
+                .cloned()
+                .collect::<Vec<String>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
 
 /// Shared key for the debug-report endpoint. It only gates
 /// random spam: the endpoint accepts a small JSON, stores it
@@ -58,6 +86,9 @@ fn upload_crash_report(crash_args: &[serde_json::Value]) {
         std::thread::sleep(std::time::Duration::from_millis(400));
         log_tail = read_tail();
     }
+    if log_tail.is_empty() {
+        log_tail = ring_tail();
+    }
     let payload = serde_json::json!({
         "app": "orca-rust-desktop",
         "version": env!("CARGO_PKG_VERSION"),
@@ -90,22 +121,16 @@ fn upload_crash_report(crash_args: &[serde_json::Value]) {
 static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn log_call(path: &str, args: &[serde_json::Value]) {
+    // The ring is written unconditionally — it is the
+    // fallback that keeps uploads useful even when the
+    // log file is unavailable.
+    let summary = serde_json::to_string(args)
+        .unwrap_or_default()
+        .replace(['\n', '\r', '\t'], " ");
+    let summary: String = summary.chars().take(4000).collect();
+    ring_push(&format!("{path}\t{}\t{summary}", args.len()));
     if let Ok(mut slot) = CALL_LOG.lock() {
         if let Some(file) = slot.as_mut() {
-            // Args are logged (truncated, single line) because the
-            // renderer reports its own crashes through
-            // crashReports.recordRendererError — the message only
-            // exists in the args. Crash-report calls keep a much
-            // larger slice: their errorStack field carries the
-            // full JS stack, which the 600-char cut amputated.
-            // Debug mode (0.6.3): every call is logged with a
-            // full-size slice — all inputs and errors must be
-            // reconstructable from this log alone.
-            let limit = 4000;
-            let summary = serde_json::to_string(args)
-                .unwrap_or_default()
-                .replace(['\n', '\r', '\t'], " ");
-            let summary: String = summary.chars().take(limit).collect();
             let _ = writeln!(file, "{path}\t{}\t{summary}", args.len());
             let _ = file.flush();
         }
@@ -122,12 +147,13 @@ fn log_answer(path: &str, value: &serde_json::Value) {
     if path.starts_with("app.startupDiagnostic") || path.starts_with("crashReports.") {
         return;
     }
+    let summary = serde_json::to_string(value)
+        .unwrap_or_default()
+        .replace(['\n', '\r', '\t'], " ");
+    let summary: String = summary.chars().take(2000).collect();
+    ring_push(&format!("-> {path}\t{summary}"));
     if let Ok(mut slot) = CALL_LOG.lock() {
         if let Some(file) = slot.as_mut() {
-            let summary = serde_json::to_string(value)
-                .unwrap_or_default()
-                .replace(['\n', '\r', '\t'], " ");
-            let summary: String = summary.chars().take(2000).collect();
             let _ = writeln!(file, "-> {path}\t{summary}");
             let _ = file.flush();
         }
@@ -245,6 +271,71 @@ fn uninstall_plan(state: &BridgeState) -> serde_json::Value {
 
 fn domain_or(state: &BridgeState, domain: &str, fallback: serde_json::Value) -> serde_json::Value {
     orca_daemon_rs::profile_state::read_domain(&state.profile_dir, domain).unwrap_or(fallback)
+}
+
+/// MemorySnapshot for the resource manager: real host
+/// memory and this process's usage via sysinfo; per-
+/// worktree rows arrive with the terminal wiring.
+fn memory_snapshot() -> serde_json::Value {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    sys.refresh_cpu_usage();
+    let total = sys.total_memory();
+    let free = sys.free_memory();
+    let avail = sys.available_memory();
+    let used = total.saturating_sub(avail);
+    let percent = if total > 0 {
+        used as f64 * 100.0 / total as f64
+    } else {
+        0.0
+    };
+    let cores = sys.cpus().len() as u32;
+    let load1 = sysinfo::System::load_average().one;
+    let own_id = std::process::id();
+    let (app_mem, app_cpu) = sys
+        .processes()
+        .values()
+        .find(|p| p.pid().as_u32() == own_id)
+        .map(|p| (p.memory(), p.cpu_usage() as f64))
+        .unwrap_or((0, 0.0));
+    let usage = |cpu: f64, memory: u64| serde_json::json!({ "cpu": cpu, "memory": memory });
+    serde_json::json!({
+        "app": {
+            "cpu": app_cpu,
+            "memory": app_mem,
+            "main": usage(app_cpu, app_mem),
+            "renderer": usage(0.0, 0),
+            "other": usage(0.0, 0),
+            "history": [],
+        },
+        "worktrees": [],
+        "host": {
+            "totalMemory": total,
+            "freeMemory": free,
+            "availableMemory": avail,
+            "availableMemorySource": "free-memory",
+            "usedMemory": used,
+            "memoryUsagePercent": percent,
+            "cpuCoreCount": cores,
+            "loadAverage1m": load1,
+        },
+        "processMemoryMetric": if cfg!(target_os = "windows") { "working-set" } else { "rss" },
+        "totalCpu": app_cpu,
+        "totalMemory": app_mem,
+        "collectedAt": now_millis(),
+    })
+}
+
+/// Emits the renderer's maximize-changed subscription
+/// and records the state so resize events only fire on
+/// real transitions.
+fn emit_maximize_changed(app: &tauri::AppHandle, maximized: bool) {
+    use tauri::Emitter;
+    LAST_MAXIMIZED.store(maximized, Ordering::Relaxed);
+    let _ = app.emit(
+        "ipc_event",
+        serde_json::json!({ "path": "ui.onMaximizeChanged", "args": [maximized] }),
+    );
 }
 
 fn empty_list() -> serde_json::Value {
@@ -747,6 +838,69 @@ fn ipc_invoke(
         // the Privacy toggle never stuck because the consent
         // state read was null.
         "plugins.listMarketplacePlugins" => empty_list(),
+        // {pluginKeys, notify} — the required-plugin
+        // failures watcher destructures the result into
+        // its store; null/{} poisoned pluginKeys to
+        // undefined and Settings crashed on .filter
+        // (0.6.5 crash report, fn Roe).
+        "plugins.takeRequiredPluginFailures" => serde_json::json!({
+            "pluginKeys": [],
+            "notify": false,
+        }),
+        // StatsSummary — the resource views treat a
+        // summary without a numeric totalAgentsSpawned
+        // as "no data" and never finish loading.
+        "stats.getSummary" => serde_json::json!({
+            "totalAgentsSpawned": 0,
+            "totalPRsCreated": 0,
+            "totalAgentTimeMs": 0,
+            "firstEventAt": null,
+        }),
+        // MemorySnapshot with real host + own-process
+        // numbers (sysinfo); worktree/session rows fill
+        // in when the terminal wiring lands.
+        "memory.getSnapshot" => memory_snapshot(),
+        "memory.countHiddenBrowserPages" => serde_json::json!(0),
+        // PtyListedSession[] for the resource manager.
+        "pty.listSessions" => empty_list(),
+        // Window controls — the renderer draws its own
+        // on Windows/Linux (upstream hides native chrome
+        // for the same reason); wired to the real window
+        // now that the native titlebar is gone.
+        "ui.minimize" => {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.minimize();
+            }
+            serde_json::Value::Null
+        }
+        "ui.maximize" => {
+            if let Some(w) = app.get_webview_window("main") {
+                let now = if w.is_maximized().unwrap_or(false) {
+                    let _ = w.unmaximize();
+                    false
+                } else {
+                    let _ = w.maximize();
+                    true
+                };
+                emit_maximize_changed(&app, now);
+            }
+            serde_json::Value::Null
+        }
+        "ui.isMaximized" => {
+            let maximized = app
+                .get_webview_window("main")
+                .and_then(|w| w.is_maximized().ok())
+                .unwrap_or(false);
+            serde_json::json!(maximized)
+        }
+        "ui.requestClose" => {
+            if let Some(w) = app.get_webview_window("main") {
+                // Goes through CloseRequested, so the
+                // open-session confirmation still runs.
+                let _ = w.close();
+            }
+            serde_json::Value::Null
+        }
         "plugins.listMarketplaces" => empty_list(),
         "plugins.refreshMarketplaces" => empty_list(),
         "runtimeEnvironments.managedOrcad.listPendingMigrations" => empty_list(),
@@ -1479,6 +1633,12 @@ fn main() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Resized(_) = event {
+                let maximized = window.is_maximized().unwrap_or(false);
+                if maximized != LAST_MAXIMIZED.load(Ordering::Relaxed) {
+                    emit_maximize_changed(window.app_handle(), maximized);
+                }
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if SESSION_ACTIVE.load(Ordering::Relaxed) {
                     api.prevent_close();
@@ -1541,6 +1701,13 @@ fn main() {
                 tauri::WebviewUrl::App("index.html".into()),
             )
             .title("Orca Rust Desktop")
+            // Upstream hides native chrome on Windows
+            // ('hidden') and Linux (frame: false) — the
+            // renderer draws its own titlebar and window
+            // controls; keeping the native bar is what
+            // doubled his topbar. macOS keeps its native
+            // decorations + traffic lights.
+            .decorations(std::env::consts::OS != "macos")
             .inner_size(1440.0, 900.0)
             .min_inner_size(900.0, 600.0)
             .center()
