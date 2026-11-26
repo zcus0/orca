@@ -139,6 +139,9 @@ struct BridgeState {
     rpc: Mutex<orca_daemon_rs::rpc::Rpc>,
     rpc_seq: Mutex<u64>,
     telemetry_opt_in: Mutex<Option<bool>>,
+    updater_status: Mutex<serde_json::Value>,
+    updater_found: Mutex<Option<(String, String)>>,
+    updater_installer: Mutex<Option<PathBuf>>,
 }
 
 /// Telemetry consent lives in its own profile-state domain
@@ -520,7 +523,118 @@ fn ipc_invoke(
         // null crashed it ("reading 'state'"). {state:'idle'}
         // is the valid no-update state; getVersion is a plain
         // string.
-        "updater.getStatus" => serde_json::json!({ "state": "idle" }),
+        // The updater surface (update-status-types): the
+        // status is stateful — updater.check runs the real
+        // release-feed check and pushes onStatus events;
+        // download/quitAndInstall complete the flow the
+        // Settings section drives. The background auto-check
+        // with its native prompt runs separately.
+        "updater.getStatus" => state
+            .updater_status
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|_| serde_json::json!({ "state": "idle" })),
+        "updater.check" => {
+            let handle = app.clone();
+            std::thread::spawn(move || run_inapp_update_check(handle));
+            serde_json::Value::Null
+        }
+        "updater.download" => {
+            let handle = app.clone();
+            std::thread::spawn(move || run_inapp_update_download(handle));
+            serde_json::Value::Null
+        }
+        "updater.quitAndInstall" => {
+            let installer = state
+                .updater_installer
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone());
+            if let Some(path) = installer {
+                if std::process::Command::new(&path).spawn().is_ok() {
+                    updater_log("quitAndInstall: installer launched, exiting");
+                    app.exit(0);
+                }
+            }
+            serde_json::Value::Null
+        }
+        "updater.listBuilds" => {
+            let channel = args
+                .first()
+                .and_then(|a| a.as_str())
+                .unwrap_or("dev")
+                .to_string();
+            let fetched = reqwest::blocking::Client::builder()
+                .user_agent("orca-rust-desktop-updater")
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|client| {
+                    client
+                        .get("https://api.github.com/repos/zcus0/orca/releases/tags/desktop-dev")
+                        .send()
+                        .and_then(|r| r.error_for_status())
+                        .and_then(|r| r.json::<serde_json::Value>())
+                        .map_err(|e| e.to_string())
+                });
+            match fetched {
+                Ok(release) => {
+                    let mut newest: Option<(String, String)> = None;
+                    if let Some(assets) = release.get("assets").and_then(|a| a.as_array()) {
+                        for asset in assets {
+                            let name =
+                                asset.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            if let Some(vstr) = name
+                                .strip_prefix("Orca.Rust.Desktop_")
+                                .and_then(|rest| rest.strip_suffix("_x64-setup.exe"))
+                            {
+                                let url = asset
+                                    .get("browser_download_url")
+                                    .and_then(|u| u.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let replace = match &newest {
+                                    None => true,
+                                    Some((cur, _)) => {
+                                        parse_version(vstr) > parse_version(cur)
+                                    }
+                                };
+                                if replace {
+                                    newest = Some((vstr.to_string(), url));
+                                }
+                            }
+                        }
+                    }
+                    let builds = match newest {
+                        Some((version, url)) => serde_json::json!([{
+                            "tag": "desktop-dev",
+                            "version": version,
+                            "channel": channel,
+                            "name": release.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                            "publishedAt": release.get("published_at").cloned().unwrap_or(serde_json::Value::Null),
+                            "releaseUrl": release.get("html_url").and_then(|u| u.as_str()).unwrap_or(""),
+                            "installerUrl": url,
+                        }]),
+                        None => serde_json::json!([]),
+                    };
+                    serde_json::json!({
+                        "ok": true,
+                        "channel": channel,
+                        "builds": builds,
+                    })
+                }
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "channel": channel,
+                    "message": e,
+                }),
+            }
+        }
+        "updater.getLinuxPackageInstallInstructions" => serde_json::json!({
+            "ok": false,
+            "reason": "no-package-manager",
+            "message": "This is not a Linux package install.",
+        }),
         "updater.getVersion" => serde_json::json!(env!("CARGO_PKG_VERSION")),
         "rateLimits.get" | "rateLimits.refresh" => empty_rate_limit_state(),
         // Skill discovery: the settings CLI page and the skill
@@ -711,6 +825,32 @@ fn ipc_invoke(
         "agentStatus.getSnapshot" => empty_list(),
         "dashboard.getPopoutOpen" => serde_json::json!(false),
         "ui.consumePendingMarkdownFileOpens" => empty_list(),
+        // Read-only statuses from the settings sweep:
+        // lists answer [], the rest their empty shapes.
+        "developerPermissions.getStatus" => empty_list(),
+        "browser.extensionsList" => empty_list(),
+        "mobile.listRuntimeAccessGrants" => empty_list(),
+        "settings.listFonts" => empty_list(),
+        "computerUsePermissions.getStatus" => serde_json::json!({
+            "platform": state.platform,
+            "helperAppPath": null,
+            "helperUnavailableReason": "Computer Use is not available on this runtime.",
+            "permissions": [],
+        }),
+        "cli.getWslInstallStatus" => serde_json::json!({
+            "platform": state.platform,
+            "commandName": "orca",
+            "commandPath": null,
+            "pathDirectory": null,
+            "pathConfigured": null,
+            "launcherPath": null,
+            "installMethod": null,
+            "supported": false,
+            "state": "unsupported",
+            "currentTarget": null,
+            "unsupportedReason": "platform_not_supported",
+            "detail": null,
+        }),
         "claudeUsage.getScanState" => serde_json::json!({
             "enabled": true,
             "isScanning": false,
@@ -1035,24 +1175,9 @@ fn updater_log(msg: &str) {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn check_for_update(app: tauri::AppHandle) {
-    use tauri_plugin_dialog::MessageDialogButtons;
-    updater_log(&format!(
-        "check start (current {})",
-        env!("CARGO_PKG_VERSION")
-    ));
-    let client = match reqwest::blocking::Client::builder()
-        .user_agent("orca-rust-desktop-updater")
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            updater_log(&format!("client build failed: {e}"));
-            return;
-        }
-    };
+/// Scans the desktop-dev release for the newest Windows
+/// setup exe newer than this build. Returns (version, url).
+fn fetch_newer_release(client: &reqwest::blocking::Client) -> Option<(String, String)> {
     let release: serde_json::Value = match client
         .get("https://api.github.com/repos/zcus0/orca/releases/tags/desktop-dev")
         .send()
@@ -1062,7 +1187,7 @@ fn check_for_update(app: tauri::AppHandle) {
         Ok(v) => v,
         Err(e) => {
             updater_log(&format!("release fetch failed: {e}"));
-            return;
+            return None;
         }
     };
     let current = parse_version(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0, 0));
@@ -1087,7 +1212,153 @@ fn check_for_update(app: tauri::AppHandle) {
             }
         }
     }
-    let Some((_, vstr, url)) = best else {
+    best.map(|(_, vstr, url)| (vstr, url))
+}
+
+/// Stores the updater status the Settings section renders
+/// and pushes it to the renderer's onStatus subscribers.
+fn set_updater_status(app: &tauri::AppHandle, state: &BridgeState, status: serde_json::Value) {
+    if let Ok(mut slot) = state.updater_status.lock() {
+        *slot = status.clone();
+    }
+    use tauri::Emitter;
+    let _ = app.emit(
+        "ipc_event",
+        serde_json::json!({ "path": "updater.onStatus", "args": [status] }),
+    );
+}
+
+/// The Settings "Check for updates" flow (updater.check):
+/// real fetch against the release feed, status pushed
+/// through getStatus/onStatus — no native dialog here;
+/// the dialog belongs to the background auto-check.
+fn run_inapp_update_check(app: tauri::AppHandle) {
+    use tauri::Manager;
+    let st = app.state::<BridgeState>();
+    let state: &BridgeState = &st;
+    set_updater_status(
+        &app,
+        state,
+        serde_json::json!({ "state": "checking", "userInitiated": true }),
+    );
+    let client = match reqwest::blocking::Client::builder()
+        .user_agent("orca-rust-desktop-updater")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            updater_log(&format!("in-app check client failed: {e}"));
+            set_updater_status(&app, state, serde_json::json!({ "state": "idle" }));
+            return;
+        }
+    };
+    match fetch_newer_release(&client) {
+        Some((vstr, url)) => {
+            updater_log(&format!("in-app check found {vstr}"));
+            if let Ok(mut slot) = state.updater_found.lock() {
+                *slot = Some((vstr.clone(), url));
+            }
+            set_updater_status(
+                &app,
+                state,
+                serde_json::json!({
+                    "state": "available",
+                    "version": vstr,
+                    "changelog": null,
+                }),
+            );
+        }
+        None => {
+            updater_log("in-app check: up to date");
+            set_updater_status(
+                &app,
+                state,
+                serde_json::json!({ "state": "not-available", "userInitiated": true }),
+            );
+        }
+    }
+}
+
+/// updater.download: fetch the installer found by the
+/// check, then report the downloaded state.
+fn run_inapp_update_download(app: tauri::AppHandle) {
+    use tauri::Manager;
+    let st = app.state::<BridgeState>();
+    let state: &BridgeState = &st;
+    let found = state.updater_found.lock().ok().and_then(|f| f.clone());
+    let Some((vstr, url)) = found else {
+        updater_log("in-app download without a found update");
+        return;
+    };
+    set_updater_status(
+        &app,
+        state,
+        serde_json::json!({ "state": "downloading", "percent": 0, "version": vstr }),
+    );
+    let client = match reqwest::blocking::Client::builder()
+        .user_agent("orca-rust-desktop-updater")
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let bytes = match client
+        .get(&url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.bytes())
+    {
+        Ok(b) => b,
+        Err(e) => {
+            updater_log(&format!("in-app download failed: {e}"));
+            set_updater_status(
+                &app,
+                state,
+                serde_json::json!({
+                    "state": "available",
+                    "version": vstr,
+                    "changelog": null,
+                }),
+            );
+            return;
+        }
+    };
+    let dest = std::env::temp_dir().join(format!("OrcaRustDesktop-{vstr}-setup.exe"));
+    if std::fs::write(&dest, &bytes).is_err() {
+        updater_log("in-app download write failed");
+        return;
+    }
+    if let Ok(mut slot) = state.updater_installer.lock() {
+        *slot = Some(dest);
+    }
+    set_updater_status(
+        &app,
+        state,
+        serde_json::json!({ "state": "downloaded", "version": vstr }),
+    );
+}
+
+#[cfg(target_os = "windows")]
+fn check_for_update(app: tauri::AppHandle) {
+    use tauri_plugin_dialog::MessageDialogButtons;
+    updater_log(&format!(
+        "check start (current {})",
+        env!("CARGO_PKG_VERSION")
+    ));
+    let client = match reqwest::blocking::Client::builder()
+        .user_agent("orca-rust-desktop-updater")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            updater_log(&format!("client build failed: {e}"));
+            return;
+        }
+    };
+    let Some((vstr, url)) = fetch_newer_release(&client) else {
         updater_log("no newer version found");
         return;
     };
@@ -1240,6 +1511,9 @@ fn main() {
             rpc: Mutex::new(rpc),
             rpc_seq: Mutex::new(0),
             telemetry_opt_in: Mutex::new(None),
+            updater_status: Mutex::new(serde_json::json!({ "state": "idle" })),
+            updater_found: Mutex::new(None),
+            updater_installer: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![ipc_invoke])
         .setup(move |app| {
