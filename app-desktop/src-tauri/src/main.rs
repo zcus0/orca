@@ -44,7 +44,7 @@ fn upload_crash_report(crash_args: &[serde_json::Value]) {
         .and_then(|path| std::fs::read_to_string(path).ok())
         .map(|text| {
             let lines: Vec<&str> = text.lines().collect();
-            let start = lines.len().saturating_sub(300);
+            let start = lines.len().saturating_sub(900);
             lines[start..].join("\n")
         })
         .unwrap_or_default();
@@ -88,11 +88,10 @@ fn log_call(path: &str, args: &[serde_json::Value]) {
             // exists in the args. Crash-report calls keep a much
             // larger slice: their errorStack field carries the
             // full JS stack, which the 600-char cut amputated.
-            let limit = if path.starts_with("crashReports.") {
-                4000
-            } else {
-                600
-            };
+            // Debug mode (0.6.3): every call is logged with a
+            // full-size slice — all inputs and errors must be
+            // reconstructable from this log alone.
+            let limit = 4000;
             let summary = serde_json::to_string(args)
                 .unwrap_or_default()
                 .replace(['\n', '\r', '\t'], " ");
@@ -118,7 +117,7 @@ fn log_answer(path: &str, value: &serde_json::Value) {
             let summary = serde_json::to_string(value)
                 .unwrap_or_default()
                 .replace(['\n', '\r', '\t'], " ");
-            let summary: String = summary.chars().take(800).collect();
+            let summary: String = summary.chars().take(2000).collect();
             let _ = writeln!(file, "-> {path}\t{summary}");
             let _ = file.flush();
         }
@@ -1342,7 +1341,6 @@ fn run_inapp_update_download(app: tauri::AppHandle) {
 
 #[cfg(target_os = "windows")]
 fn check_for_update(app: tauri::AppHandle) {
-    use tauri_plugin_dialog::MessageDialogButtons;
     updater_log(&format!(
         "check start (current {})",
         env!("CARGO_PKG_VERSION")
@@ -1362,45 +1360,12 @@ fn check_for_update(app: tauri::AppHandle) {
         updater_log("no newer version found");
         return;
     };
-    updater_log(&format!("found {vstr}, asking user"));
-    // The prompt runs on the main thread (the platform-correct
-    // owner for a modal dialog); this worker waits for the
-    // answer with a timeout so a stuck dialog cannot wedge
-    // the update loop.
-    let (tx, rx) = std::sync::mpsc::channel::<bool>();
-    let dialog_app = app.clone();
-    let dialog_version = vstr.clone();
-    let shown = app.run_on_main_thread(move || {
-        let mut builder = dialog_app
-            .dialog()
-            .message(format!(
-                "Orca Rust Desktop {dialog_version} is available — you have {}. Download and install the update now? The app will close and the installer will take over.",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .title("Update available")
-            .buttons(MessageDialogButtons::YesNo);
-        if let Some(window) = dialog_app.get_webview_window("main") {
-            builder = builder.parent(&window);
-        }
-        let yes = builder.blocking_show();
-        let _ = tx.send(yes);
-    });
-    let yes = match shown {
-        Ok(()) => rx
-            .recv_timeout(std::time::Duration::from_secs(600))
-            .unwrap_or_else(|_| {
-                updater_log("dialog answer timed out");
-                false
-            }),
-        Err(e) => {
-            updater_log(&format!("dialog dispatch failed: {e}"));
-            false
-        }
-    };
-    updater_log(&format!("user answer: {yes}"));
-    if !yes {
-        return;
-    }
+    // Silent auto-update (0.6.3, his standing order): no
+    // prompt, no manual install — download, run the
+    // installer silently, exit so it can replace the app.
+    // Every step is logged; any failure leaves the app
+    // running untouched.
+    updater_log(&format!("found {vstr} — auto-updating silently"));
     let dest = std::env::temp_dir().join(format!("OrcaRustDesktop-{vstr}-setup.exe"));
     let bytes = match client
         .get(&url)
@@ -1419,9 +1384,12 @@ fn check_for_update(app: tauri::AppHandle) {
         updater_log(&format!("installer write failed: {e}"));
         return;
     }
-    match std::process::Command::new(&dest).spawn() {
+    match std::process::Command::new(&dest).args(["/S", "/UPDATE"]).spawn() {
         Ok(_) => {
-            updater_log("installer launched, exiting");
+            updater_log("silent installer launched, exiting");
+            // Give the installer a moment to start before
+            // this process lets go of its files.
+            std::thread::sleep(std::time::Duration::from_millis(1500));
             app.exit(0);
         }
         Err(e) => updater_log(&format!("installer launch failed: {e}")),

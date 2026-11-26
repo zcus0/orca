@@ -59,4 +59,48 @@
   } catch (e) {
     window.api = makeNode('');
   }
+
+  // Debug mode: every renderer error lands in the bridge
+  // log, and hard errors also ride the crash-upload
+  // pipeline so they are visible without opening the app.
+  function reportError(kind, message, stack) {
+    try {
+      core.invoke('ipc_invoke', {
+        path: 'crashReports.recordRendererError',
+        args: [{
+          message: String(message || ''),
+          errorStack: String(stack || ''),
+          boundaryId: kind,
+          source: 'shim-error-hook'
+        }]
+      });
+    } catch (e) { /* never recurse */ }
+  }
+  window.addEventListener('error', (event) => {
+    // Resource-load failures carry no message; only real
+    // script errors are worth an upload.
+    if (!event.message) return;
+    reportError('window.error', event.message, event.error && event.error.stack);
+  });
+  window.addEventListener('unhandledrejection', (event) => {
+    const reason = event.reason;
+    reportError(
+      'unhandledrejection',
+      (reason && reason.message) || String(reason),
+      reason && reason.stack
+    );
+  });
+  const originalConsoleError = console.error.bind(console);
+  console.error = function (...parts) {
+    try {
+      core.invoke('ipc_invoke', {
+        path: 'renderer.consoleError',
+        args: [parts.map((p) => {
+          try { return typeof p === 'string' ? p : JSON.stringify(p); }
+          catch (e) { return String(p); }
+        }).join(' ').slice(0, 2000)]
+      });
+    } catch (e) { /* log only */ }
+    return originalConsoleError(...parts);
+  };
 })();
