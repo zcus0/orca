@@ -15,6 +15,7 @@
 mod agents;
 mod channel;
 mod e2ee;
+pub mod client;
 pub mod graph;
 mod multiplex;
 pub mod profile_state;

@@ -16,6 +16,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
 ed25519-dalek = "2"
 getrandom = "0.3"
+tokio-tungstenite = "0.26"
 rusqlite = { version = "0.34", features = ["bundled"] }
 portable-pty = "0.9"
 
