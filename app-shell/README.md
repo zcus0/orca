@@ -21,24 +21,32 @@ machinery, updater, debug logging, window controls) retargeted:
   5f27429c3); the desktop renderer builds clean from it and
   the default-settings key set is unchanged (257 keys).
 
-## What remains before this is real
+## Status
 
-1. **orcad supervision**: spawn the bundled orcad in serve
-   mode on a loopback port with the pinned Node runtime —
-   the supervisor pattern from the frozen `desktop/` app
-   (0.2.2) carries over; CI must bundle the orcad slot +
-   `out/runtimes` the same way that line did.
-2. **E2EE client**: `runtime.call` currently still routes
-   to the in-process daemon-rs placeholder. The real target
-   is the spawned orcad's WS RPC, which needs the client
-   half of the pairing protocol (daemon-rs has the host
-   half; the E2E test client proves the wire format).
-3. **Terminal/pty domain**: same open item as Fase 4 — the
-   desktop renderer's terminals speak to the daemon's v62
-   socket through the main process upstream; here they
-   must ride the serve connection like upstream's own
-   remote mode does.
+- The E2EE client exists and is proven: `daemon-rs`'s
+  `client::RuntimeClient` paired with a real upstream
+  orcad serve and answered `status.get` / `repo.list`
+  (proof binary: `daemon-rs/src/bin/orca-client-test.rs`).
+- The shell wires it in: on startup it spawns the bundled
+  orcad in serve mode against the real profile (pinned
+  Node resolved from the slot markers), pairs, and routes
+  `runtime.call` to the serve first — the in-process
+  daemon-rs RPC remains as fallback. The orcad child is
+  killed on app exit so the profile lock is released.
+- CI: `.github/workflows/orca-shell-release.yml` builds
+  renderer + orcad + web client, bundles all three plus
+  the pinned runtimes, and publishes `tauri-v*` tags as
+  versioned releases (dispatch → rolling `shell-dev`).
 
-Until 1–2 land, this app is a scaffold: it boots the
-desktop UI against the real profile's stored state, but
-agent execution is not yet upstream's.
+## What remains
+
+1. **Terminal/pty domain**: the desktop renderer's
+   terminals speak the daemon's v62 stream protocol; over
+   the serve link they must ride the client's binary
+   frames (the client currently surfaces text RPC only).
+2. **Server-pushed events**: `runtime.subscribe` events
+   from the serve are not yet forwarded into the shim's
+   `on*` subscriptions.
+3. First-release shakeout: bridge gaps the new upstream
+   renderer hits will arrive via the same crash-upload
+   channel as the Fase 4 line (app name `orca-shell`).

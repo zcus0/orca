@@ -1,19 +1,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! Orca Shell (Fase 4) — the upstream DESKTOP
-//! renderer running on the Rust runtime, no server.
-//!
-//! The window loads the bundled desktop renderer
-//! (out/renderer from `pnpm run build:electron-vite`) and a
-//! shim injected before any renderer code defines
-//! `window.api`, standing in for the Electron preload
-//! bridge. Renderer calls land in `ipc_invoke`, which logs
-//! every path to shim-calls.log in the app data dir and
-//! answers from the local runtime: profile data comes from
-//! the same profile-state store daemon-rs serves (the RS
-//! profile, imported from the original Orca profile on
-//! first run). Nothing is spawned except the app itself;
-//! no Node, no server, no pairing for its own machine.
+//! Orca Shell — the upstream DESKTOP renderer in a Tauri
+//! shell, with the runtime left exactly as upstream ships
+//! it: the app spawns the bundled orcad in serve mode
+//! against the REAL Orca profile and pairs with it over
+//! its E2EE channel (daemon-rs's RuntimeClient); runtime
+//! calls go to that serve first. The window loads the
+//! bundled desktop renderer (out/renderer from
+//! `pnpm run build:electron-vite`) and a shim injected
+//! before any renderer code defines `window.api`, standing
+//! in for the Electron preload bridge. Renderer calls land
+//! in `ipc_invoke`, which logs every path to shim-calls.log
+//! in the app data dir; profile-state domains are answered
+//! from the same store orcad uses, and the in-process
+//! daemon-rs RPC remains as a fallback behind the link.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -177,7 +177,21 @@ struct BridgeState {
     updater_status: Mutex<serde_json::Value>,
     updater_found: Mutex<Option<(String, String)>>,
     updater_installer: Mutex<Option<PathBuf>>,
+    /// The shell-swap runtime link: requests for the spawned
+    /// orcad serve, answered by the link thread that owns the
+    /// E2EE client. None until the serve is up and paired.
+    runtime_link: Mutex<Option<tokio::sync::mpsc::Sender<RuntimeRequest>>>,
+    orcad_child: Mutex<Option<std::process::Child>>,
 }
+
+/// One runtime.call handed to the link thread: method,
+/// params, and the one-shot reply channel for the response
+/// envelope.
+type RuntimeRequest = (
+    String,
+    serde_json::Value,
+    std::sync::mpsc::Sender<serde_json::Value>,
+);
 
 /// Telemetry consent lives in its own profile-state domain
 /// ("telemetryConsent": {"optIn": bool}); the cache slot
@@ -367,6 +381,30 @@ fn git_available() -> bool {
     })
 }
 
+/// Tries the spawned orcad serve first (the shell-swap
+/// runtime link): a real upstream runtime answering over
+/// the paired E2EE channel. None when the link is down or
+/// the serve errors, so the caller falls back as before.
+fn dispatch_runtime_link(
+    state: &BridgeState,
+    method: &str,
+    params: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let sender = state.runtime_link.lock().ok()?.clone()?;
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    sender
+        .blocking_send((method.to_string(), params.clone(), reply_tx))
+        .ok()?;
+    let envelope = reply_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .ok()?;
+    if envelope.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        envelope.get("result").cloned()
+    } else {
+        None
+    }
+}
+
 /// Forwards one runtime.call to the in-process daemon-rs RPC
 /// dispatch and unwraps its response envelope. None when the
 /// daemon does not implement the method (or errors), so the
@@ -376,6 +414,9 @@ fn dispatch_runtime(
     method: &str,
     params: serde_json::Value,
 ) -> Option<serde_json::Value> {
+    if let Some(result) = dispatch_runtime_link(state, method, &params) {
+        return Some(result);
+    }
     let id = {
         let mut seq = state.rpc_seq.lock().ok()?;
         *seq += 1;
@@ -685,7 +726,7 @@ fn ipc_invoke(
                             let name =
                                 asset.get("name").and_then(|n| n.as_str()).unwrap_or("");
                             if let Some(vstr) = name
-                                .strip_prefix("Orca.Rust.Desktop_")
+                                .strip_prefix("Orca.Shell_")
                                 .and_then(|rest| rest.strip_suffix("_x64-setup.exe"))
                             {
                                 let url = asset
@@ -1388,7 +1429,7 @@ fn fetch_newer_release(client: &reqwest::blocking::Client) -> Option<(String, St
             for asset in assets {
                 let name = asset.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let Some(vstr) = name
-                    .strip_prefix("Orca.Rust.Desktop_")
+                    .strip_prefix("Orca.Shell_")
                     .and_then(|rest| rest.strip_suffix("_x64-setup.exe"))
                 else {
                     continue;
@@ -1619,6 +1660,207 @@ fn original_profile_dir() -> PathBuf {
     }
 }
 
+/// Resolves the Node runtime the bundled orcad slot is
+/// pinned to, mirroring upstream's orcad-bundled-runtime:
+/// the slot's `.server-target` and `.runtime-node` markers
+/// name a runtime at `<resources>/runtimes/node-<sha>/`.
+fn resolve_pinned_node(
+    resource_dir: &std::path::Path,
+    orcad_dir: &std::path::Path,
+) -> Result<PathBuf, String> {
+    let target = std::fs::read_to_string(orcad_dir.join(".server-target"))
+        .map_err(|e| format!("cannot read the bundled runtime target: {e}"))?;
+    let sha = std::fs::read_to_string(orcad_dir.join(".runtime-node"))
+        .map_err(|e| format!("cannot read the bundled runtime marker: {e}"))?;
+    let exe: PathBuf = if target.trim().starts_with("win32") {
+        PathBuf::from("node.exe")
+    } else {
+        PathBuf::from("bin").join("node")
+    };
+    let runtime = resource_dir
+        .join("runtimes")
+        .join(format!("node-{}", sha.trim()))
+        .join(exe);
+    if !runtime.exists() {
+        return Err(format!(
+            "the bundled Node runtime is missing at {}",
+            runtime.display()
+        ));
+    }
+    Ok(runtime)
+}
+
+/// Spawns the bundled orcad in serve mode on an ephemeral
+/// loopback port against the real profile and returns the
+/// child plus the decoded pairing offer from its readiness
+/// line. Ported from the frozen desktop/ shell (0.2.2).
+fn spawn_orcad(
+    resource_dir: &std::path::Path,
+    profile_dir: &std::path::Path,
+) -> Result<(std::process::Child, serde_json::Value), String> {
+    use std::io::BufRead;
+    let _ = std::fs::create_dir_all(profile_dir);
+    let orcad_dir = resource_dir.join("orcad");
+    let node = resolve_pinned_node(resource_dir, &orcad_dir)?;
+    let web_dir = resource_dir.join("web");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(profile_dir.join("orca-shell-runtime.log"))
+        .map_err(|e| format!("runtime log: {e}"))?;
+    let mut child = std::process::Command::new(node)
+        .arg(orcad_dir.join("orcad.js"))
+        .args(["--port", "0", "--bind", "127.0.0.1", "--json"])
+        .arg("--web-client-root")
+        .arg(web_dir)
+        .env("ORCA_USER_DATA", profile_dir)
+        .env("ORCA_USER_DATA_PATH", profile_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(log))
+        .spawn()
+        .map_err(|e| format!("failed to start the bundled runtime: {e}"))?;
+    let stdout = child.stdout.take().ok_or("orcad stdout unavailable")?;
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut offer = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) == Some("orca_server_ready") {
+            let url = value
+                .get("pairing")
+                .and_then(|p| p.get("webClientUrl"))
+                .and_then(|u| u.as_str())
+                .ok_or("readiness line carries no pairing URL")?;
+            offer = Some(decode_pairing_offer(url)?);
+            break;
+        }
+    }
+    // Keep draining stdout so orcad can never block on a full pipe.
+    std::thread::spawn(move || {
+        let mut sink = String::new();
+        loop {
+            sink.clear();
+            match reader.read_line(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    let offer = offer.ok_or("orcad exited without a pairing offer (see orca-shell-runtime.log)")?;
+    Ok((child, offer))
+}
+
+/// The readiness URL's fragment is a percent-encoded
+/// `orca://pair?code=<base64url offer JSON>` URL.
+fn decode_pairing_offer(url: &str) -> Result<serde_json::Value, String> {
+    let fragment = url.split("#pairing=").nth(1).ok_or("no pairing fragment")?;
+    let decoded_url = percent_decode(fragment);
+    let code = decoded_url
+        .split("?code=")
+        .nth(1)
+        .ok_or("no pair code parameter")?;
+    let standard = code.replace('-', "+").replace('_', "/");
+    let padded = match standard.len() % 4 {
+        0 => standard,
+        n => format!("{standard}{}", "=".repeat(4 - n)),
+    };
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(padded)
+        .map_err(|e| format!("offer base64: {e}"))?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("offer json: {e}"))
+}
+
+fn percent_decode(value: &str) -> String {
+    let mut out = Vec::new();
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Owns the spawned orcad and the paired E2EE client for
+/// the app's lifetime: runtime.call requests arrive over a
+/// channel from the bridge and are answered serially.
+fn start_runtime_link(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let resource_dir = match app.path().resource_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                updater_log(&format!("runtime link: no resource dir: {e}"));
+                return;
+            }
+        };
+        let profile_dir = app.state::<BridgeState>().profile_dir.clone();
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                updater_log(&format!("runtime link: tokio runtime failed: {e}"));
+                return;
+            }
+        };
+        runtime.block_on(async move {
+            let (child, offer_json) = match spawn_orcad(&resource_dir, &profile_dir) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    updater_log(&format!("runtime link: orcad spawn failed: {e}"));
+                    return;
+                }
+            };
+            if let Ok(mut slot) = app.state::<BridgeState>().orcad_child.lock() {
+                *slot = Some(child);
+            }
+            let Some(offer) = orca_daemon_rs::client::parse_offer(&offer_json) else {
+                updater_log("runtime link: pairing offer did not parse");
+                return;
+            };
+            let mut client = match orca_daemon_rs::client::RuntimeClient::connect(&offer).await {
+                Ok(client) => client,
+                Err(e) => {
+                    updater_log(&format!("runtime link: E2EE connect failed: {e}"));
+                    return;
+                }
+            };
+            updater_log("runtime link: paired with the local orcad serve");
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<RuntimeRequest>(32);
+            if let Ok(mut slot) = app.state::<BridgeState>().runtime_link.lock() {
+                *slot = Some(tx);
+            }
+            while let Some((method, params, reply)) = rx.recv().await {
+                let envelope = match client.call(&method, params).await {
+                    Ok(value) => value,
+                    Err(e) => serde_json::json!({
+                        "ok": false,
+                        "error": { "code": "link_error", "message": e }
+                    }),
+                };
+                let _ = reply.send(envelope);
+            }
+        });
+    });
+}
+
 fn main() {
     let profile_dir = original_profile_dir();
     let stored_settings =
@@ -1711,6 +1953,8 @@ fn main() {
             updater_status: Mutex::new(serde_json::json!({ "state": "idle" })),
             updater_found: Mutex::new(None),
             updater_installer: Mutex::new(None),
+            runtime_link: Mutex::new(None),
+            orcad_child: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![ipc_invoke])
         .setup(move |app| {
@@ -1753,6 +1997,7 @@ fn main() {
             .center()
             .initialization_script(&shim)
             .build()?;
+            start_runtime_link(app.handle().clone());
             // Background update checks: first a few seconds
             // after the window is up so the prompt never
             // fights first paint, then every minute (his
@@ -1771,6 +2016,20 @@ fn main() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Orca Shell");
+        .build(tauri::generate_context!())
+        .expect("error while building Orca Shell");
+    app.run(|handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            // The spawned orcad holds the real profile's
+            // instance lock; leaving it behind would block
+            // the original Orca from starting afterwards.
+            if let Some(state) = handle.try_state::<BridgeState>() {
+                if let Ok(mut slot) = state.orcad_child.lock() {
+                    if let Some(mut child) = slot.take() {
+                        let _ = child.kill();
+                    }
+                }
+            }
+        }
+    });
 }

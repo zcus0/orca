@@ -1,0 +1,111 @@
+name: orca-shell-release
+
+# TAURI LINE — shell swap. Builds Orca Shell: the upstream
+# DESKTOP renderer bundled into the Tauri shell, while the
+# runtime stays upstream's own orcad — built here, bundled
+# with its pinned Node runtimes, spawned by the shell in
+# serve mode against the real Orca profile.
+# - Push a tauri-v* tag -> versioned "Orca Shell" release
+# - Manual run          -> rolling "shell-dev" prerelease
+
+on:
+  push:
+    tags: ['tauri-v*']
+  workflow_dispatch:
+
+concurrency:
+  group: orca-shell-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.m.outputs.tag }}
+      prerelease: ${{ steps.m.outputs.prerelease }}
+      name: ${{ steps.m.outputs.name }}
+    steps:
+      - id: m
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/tauri-v* ]]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "name=Orca Shell ${GITHUB_REF_NAME#tauri-}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=shell-dev" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "name=Orca Shell (dev, rolling)" >> "$GITHUB_OUTPUT"
+          fi
+
+  app:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: nsis,msi
+            artifact_glob: |
+              app-shell/src-tauri/target/release/bundle/nsis/*.exe
+              app-shell/src-tauri/target/release/bundle/msi/*.msi
+          - os: ubuntu-22.04
+            bundles: appimage,deb
+            artifact_glob: |
+              app-shell/src-tauri/target/release/bundle/appimage/*.AppImage
+              app-shell/src-tauri/target/release/bundle/deb/*.deb
+          - os: macos-latest
+            bundles: dmg
+            artifact_glob: |
+              app-shell/src-tauri/target/release/bundle/dmg/*.dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app-shell/src-tauri
+      - name: Linux webview dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2
+      - name: Build renderer, orcad and the web client
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build:electron-vite
+          pnpm run build:orcad
+          pnpm run build:web
+      - name: Assemble the bundled resources
+        shell: bash
+        run: |
+          rm -rf app-shell/resources/renderer app-shell/resources/orcad app-shell/resources/runtimes app-shell/resources/web
+          cp -r out/renderer app-shell/resources/renderer
+          cp -r out/orcad app-shell/resources/orcad
+          cp -r out/runtimes app-shell/resources/runtimes
+          cp -r out/web app-shell/resources/web
+          du -sh app-shell/resources/*
+      - name: Install the Tauri CLI
+        working-directory: app-shell
+        run: npm install
+      - name: Generate icons from the upstream Orca icon
+        working-directory: app-shell
+        run: npx tauri icon ../resources/build/icon.png
+      - name: Build bundles
+        working-directory: app-shell
+        run: npx tauri build --bundles ${{ matrix.bundles }}
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.name }}
+          prerelease: ${{ needs.meta.outputs.prerelease }}
+          files: ${{ matrix.artifact_glob }}

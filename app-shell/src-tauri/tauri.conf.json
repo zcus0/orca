@@ -20,8 +20,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "longDescription": "Orca Rust Desktop (Fase 4) is the full-Rust build of Orca whose window loads the upstream DESKTOP renderer locally and talks to the in-process Rust runtime through a window.api bridge \u2014 no server, no pairing for its own machine. It uses its own Orca RS profile, separate from the original Orca, so both can run at the same time.",
-    "shortDescription": "Orca Rust Desktop - desktop renderer on the Rust runtime, no server",
+    "longDescription": "Orca Shell is upstream Orca with its Electron shell replaced by Tauri: the window loads the upstream DESKTOP renderer locally and talks through a window.api bridge, while the runtime stays upstream's own orcad — spawned locally in serve mode against the real Orca profile and reached over its paired E2EE channel. Same runtime, same data; only the shell is lighter.",
+    "resources": {
+      "../resources/orcad": "orcad",
+      "../resources/runtimes": "runtimes",
+      "../resources/web": "web"
+    },
+    "shortDescription": "Orca Shell - desktop renderer in a Tauri shell, upstream orcad runtime",
     "targets": "all",
     "windows": {
       "nsis": {
