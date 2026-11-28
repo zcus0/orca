@@ -79,10 +79,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2
       - name: Build renderer, orcad and the web client
- shell: bash
+        shell: bash
         run: |
           pnpm install --frozen-lockfile
- pnpm -C mobile install --frozen-lockfile
+          pnpm -C mobile install --frozen-lockfile
           pnpm run build:electron-vite
           pnpm run build:mobile-web
           pnpm run build:orcad
