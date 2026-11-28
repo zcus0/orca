@@ -21,7 +21,12 @@
       "icons/icon.ico"
     ],
     "longDescription": "Orca Shell is upstream Orca with its Electron shell replaced by Tauri: the window loads the upstream DESKTOP renderer locally and talks through a window.api bridge, while the runtime stays upstream's own orcad — spawned locally in serve mode against the real Orca profile and reached over its paired E2EE channel. Same runtime, same data; only the shell is lighter.",
-    "shortDescription": "Orca Shell - desktop renderer in a Tauri shell, upstream orcad runtime",
+    "resources": {
+  "../resources/orcad": "orcad",
+  "../resources/runtimes": "runtimes",
+  "../resources/web": "web"
+},
+"shortDescription": "Orca Shell - desktop renderer in a Tauri shell, upstream orcad runtime",
     "targets": "all",
     "windows": {
       "nsis": {
@@ -34,5 +39,5 @@
   },
   "identifier": "dev.zcus.orca.shell",
   "productName": "Orca Shell",
-  "version": "0.1.1"
+  "version": "0.1.2"
 }

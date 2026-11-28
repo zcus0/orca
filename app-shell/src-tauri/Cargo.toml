@@ -1,6 +1,6 @@
 [package]
 name = "orca-shell-app"
-version = "0.1.1"
+version = "0.1.2"
 description = "Orca Shell - the upstream desktop renderer in a Tauri shell, runtime stays upstream orcad on the real profile"
 edition = "2021"
 
