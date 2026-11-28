@@ -1902,7 +1902,7 @@ fn main() {
             graph,
         )
     };
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         // Single instance: a second launch (or the installer
         // relaunching the app while it runs) focuses the
         // existing window instead of spawning another one

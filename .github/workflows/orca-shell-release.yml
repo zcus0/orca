@@ -82,6 +82,7 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm run build:electron-vite
+          pnpm run build:mobile-web
           pnpm run build:orcad
           pnpm run build:web
       - name: Assemble the bundled resources
