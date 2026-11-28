@@ -1838,7 +1838,7 @@ fn percent_decode(value: &str) -> String {
 /// orcad entry — strip the prefix before spawning.
 fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     let text = path.to_string_lossy();
-    if let Some(rest) = text.strip_prefix(r"\\?\") {
+    if let Some(rest) = text.strip_prefix("\\\\?\\") {
         return PathBuf::from(rest);
     }
     path
