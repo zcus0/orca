@@ -904,6 +904,42 @@ fn ipc_invoke(
         "memory.countHiddenBrowserPages" => serde_json::json!(0),
         // PtyListedSession[] for the resource manager.
         "pty.listSessions" => empty_list(),
+        // The startup recovery path dereferences both of
+        // these; null here is what crashed the shell's first
+        // run ('filter' / 'length' on null). Gone = none the
+        // shell knows of; capabilities = unknown per id.
+        "pty.getGoneSessionIds" => empty_list(),
+        "pty.getAuthoritativeBufferSnapshotCapabilities" => {
+            let ids: Vec<serde_json::Value> = match args.first() {
+                Some(serde_json::Value::Array(items)) => items.clone(),
+                Some(obj) => obj
+                    .get("ids")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            serde_json::Value::Array(
+                ids.iter()
+                    .map(|id| serde_json::json!({ "id": id, "authoritative": null }))
+                    .collect(),
+            )
+        }
+        "worktrees.listDetected" => {
+            let repo_id = args
+                .first()
+                .and_then(|a| a.get("repoId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            serde_json::json!({
+                "repoId": repo_id,
+                "authoritative": false,
+                "source": "metadata-fallback",
+                "worktrees": [],
+                "unavailableReason": "worktree detection is not wired in this shell yet"
+            })
+        }
         // Window controls — the renderer draws its own
         // on Windows/Linux (upstream hides native chrome
         // for the same reason); wired to the real window
@@ -1797,13 +1833,24 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Tauri's resource_dir() on Windows returns a verbatim
+/// `\\?\` path, which Node's module loader refuses for the
+/// orcad entry — strip the prefix before spawning.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
 /// Owns the spawned orcad and the paired E2EE client for
 /// the app's lifetime: runtime.call requests arrive over a
 /// channel from the bridge and are answered serially.
 fn start_runtime_link(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         let resource_dir = match app.path().resource_dir() {
-            Ok(dir) => dir,
+            Ok(dir) => strip_verbatim_prefix(dir),
             Err(e) => {
                 updater_log(&format!("runtime link: no resource dir: {e}"));
                 return;
@@ -1991,7 +2038,7 @@ fn main() {
             // controls; keeping the native bar is what
             // doubled his topbar. macOS keeps its native
             // decorations + traffic lights.
-            .decorations(std::env::consts::OS != "macos")
+            .decorations(std::env::consts::OS == "macos")
             .inner_size(1440.0, 900.0)
             .min_inner_size(900.0, 600.0)
             .center()

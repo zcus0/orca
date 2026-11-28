@@ -94,6 +94,12 @@ jobs:
           cp -r out/runtimes app-shell/resources/runtimes
           cp -r out/web app-shell/resources/web
           du -sh app-shell/resources/*
+      - name: Verify the runtime entry survived assembly
+        shell: bash
+        run: |
+          test -f app-shell/resources/orcad/orcad.js
+          test -f app-shell/resources/orcad/orcad-server.js
+          ls app-shell/resources/runtimes
       - name: Install the Tauri CLI
         working-directory: app-shell
         run: npm install
